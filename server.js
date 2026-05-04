@@ -31,8 +31,18 @@ const searchUI = {
   }
 };
 
+// Handle both GET and POST for initialize
+app.get('/intercom/initialize', (req, res) => {
+  res.json(searchUI);
+});
+
 app.post('/intercom/initialize', (req, res) => {
   res.json(searchUI);
+});
+
+// Handle both GET and POST for submit
+app.get('/intercom/submit', async (req, res) => {
+  res.json(searchUI); // Default to search UI for GET requests
 });
 
 app.post('/intercom/submit', async (req, res) => {
