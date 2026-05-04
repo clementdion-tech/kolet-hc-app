@@ -5,6 +5,11 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
+// Cache for scraped content
+let contentCache = null;
+let lastCacheUpdate = 0;
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
 const searchUI = {
   canvas: {
     content: {
@@ -42,7 +47,7 @@ app.post('/intercom/initialize', (req, res) => {
 
 // Handle both GET and POST for submit
 app.get('/intercom/submit', async (req, res) => {
-  res.json(searchUI); // Default to search UI for GET requests
+  res.json(searchUI);
 });
 
 app.post('/intercom/submit', async (req, res) => {
@@ -53,185 +58,295 @@ app.post('/intercom/submit', async (req, res) => {
   }
 
   try {
-    const articles = await searchKokoBrainLive(query);
+    console.log(`🔍 Searching KokoBrain for: "${query}"`);
+    const articles = await searchKokoBrainIntelligent(query);
+    console.log(`✅ Found ${articles.length} matching articles`);
     res.json({ canvas: buildResultsCanvas(query, articles) });
   } catch (err) {
-    console.error('KokoBrain search error:', err);
+    console.error('❌ KokoBrain search error:', err);
     res.json({ canvas: buildErrorCanvas() });
   }
 });
 
-// Fetch and search actual KokoBrain content
-async function searchKokoBrainLive(query) {
+// Intelligent KokoBrain search with content crawling
+async function searchKokoBrainIntelligent(query) {
   try {
-    console.log(`Searching KokoBrain for: "${query}"`);
+    // Get fresh content if cache is stale
+    if (!contentCache || Date.now() - lastCacheUpdate > CACHE_DURATION) {
+      console.log('🔄 Refreshing KokoBrain content cache...');
+      contentCache = await crawlKokoBrainContent();
+      lastCacheUpdate = Date.now();
+      console.log(`📚 Cached ${contentCache.length} articles`);
+    }
+
+    // Search through cached content
+    return searchCachedContent(contentCache, query);
+  } catch (error) {
+    console.error('Error in intelligent search:', error);
+    return [];
+  }
+}
+
+// Crawl and parse KokoBrain content
+async function crawlKokoBrainContent() {
+  const articles = [];
+  
+  try {
+    console.log('🕷️ Crawling kokobrain.lovable.app...');
     
-    // Fetch the main KokoBrain page
+    // Fetch main page
     const response = await fetch('https://kokobrain.lovable.app', {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; Kolet-HelpCenter/1.0)'
+        'User-Agent': 'Mozilla/5.0 (compatible; KoletBot/1.0)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
       }
     });
-    
+
     if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
-    
+
     const html = await response.text();
-    console.log('Successfully fetched KokoBrain content');
-    
-    // Extract content and search
-    const results = await parseAndSearchKokoBrain(html, query);
-    console.log(`Found ${results.length} matching articles`);
-    
-    return results;
+    console.log(`📄 Retrieved ${html.length} characters from main page`);
+
+    // Extract content using multiple parsing strategies
+    const parsedArticles = await parseKokoBrainHTML(html);
+    articles.push(...parsedArticles);
+
+    // Try to find and crawl additional pages
+    const additionalUrls = extractAdditionalUrls(html);
+    console.log(`🔗 Found ${additionalUrls.length} additional URLs to crawl`);
+
+    // Crawl up to 5 additional pages
+    for (const url of additionalUrls.slice(0, 5)) {
+      try {
+        const pageResponse = await fetch(url, {
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (compatible; KoletBot/1.0)',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+          }
+        });
+
+        if (pageResponse.ok) {
+          const pageHtml = await pageResponse.text();
+          const pageArticles = await parseKokoBrainHTML(pageHtml, url);
+          articles.push(...pageArticles);
+          console.log(`📄 Crawled ${url} - found ${pageArticles.length} articles`);
+        }
+      } catch (pageError) {
+        console.log(`⚠️ Failed to crawl ${url}:`, pageError.message);
+      }
+      
+      // Small delay to be respectful
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+
+    console.log(`✅ Total crawled articles: ${articles.length}`);
+    return articles;
+
   } catch (error) {
-    console.error('Error fetching KokoBrain:', error);
-    
-    // Fallback to enhanced mock data based on common Kolet topics
-    return searchFallbackArticles(query);
+    console.error('❌ Crawling failed:', error);
+    return [];
   }
 }
 
-// Parse HTML and extract searchable content
-async function parseAndSearchKokoBrain(html, query) {
+// Parse HTML content and extract articles
+async function parseKokoBrainHTML(html, sourceUrl = 'https://kokobrain.lovable.app') {
+  const articles = [];
+  
+  try {
+    // Clean up HTML
+    const cleanHtml = html
+      .replace(/<script[^>]*>.*?<\/script>/gis, '')
+      .replace(/<style[^>]*>.*?<\/style>/gis, '')
+      .replace(/<!--.*?-->/gis, '');
+
+    // Extract meaningful content blocks
+    const contentBlocks = extractContentBlocks(cleanHtml);
+    
+    for (const block of contentBlocks) {
+      if (block.title && block.content) {
+        articles.push({
+          title: block.title.trim(),
+          description: block.content.substring(0, 200).trim() + '...',
+          content: block.content.trim(),
+          url: sourceUrl,
+          searchText: `${block.title} ${block.content}`.toLowerCase()
+        });
+      }
+    }
+
+    // If no structured content found, create general article
+    if (articles.length === 0) {
+      const generalContent = extractGeneralContent(cleanHtml);
+      if (generalContent) {
+        articles.push({
+          title: extractTitle(cleanHtml) || 'KokoBrain Knowledge Base',
+          description: 'Internal knowledge base content',
+          content: generalContent,
+          url: sourceUrl,
+          searchText: generalContent.toLowerCase()
+        });
+      }
+    }
+
+  } catch (error) {
+    console.error('Parsing error:', error);
+  }
+
+  return articles;
+}
+
+// Extract structured content blocks
+function extractContentBlocks(html) {
+  const blocks = [];
+  
+  // Strategy 1: Look for heading + content pairs
+  const headingRegex = /<h([1-6])[^>]*>(.*?)<\/h[1-6]>/gi;
+  const headings = [...html.matchAll(headingRegex)];
+  
+  for (let i = 0; i < headings.length; i++) {
+    const heading = headings[i];
+    const title = stripHtml(heading[2]);
+    
+    // Get content between this heading and the next
+    const startPos = heading.index + heading[0].length;
+    const endPos = i < headings.length - 1 ? headings[i + 1].index : html.length;
+    const contentSection = html.substring(startPos, endPos);
+    
+    // Extract text content
+    const content = extractTextFromSection(contentSection);
+    
+    if (title.length > 2 && content.length > 20) {
+      blocks.push({ title, content });
+    }
+  }
+
+  // Strategy 2: Look for article/section tags
+  const articleRegex = /<(article|section)[^>]*>(.*?)<\/\1>/gis;
+  const articles = [...html.matchAll(articleRegex)];
+  
+  for (const article of articles) {
+    const content = extractTextFromSection(article[2]);
+    const title = extractFirstHeading(article[2]) || `Article ${blocks.length + 1}`;
+    
+    if (content.length > 20) {
+      blocks.push({ title, content });
+    }
+  }
+
+  return blocks;
+}
+
+// Extract text content from HTML section
+function extractTextFromSection(html) {
+  return stripHtml(html)
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Strip HTML tags
+function stripHtml(html) {
+  return html.replace(/<[^>]*>/g, ' ');
+}
+
+// Extract title from HTML
+function extractTitle(html) {
+  const titleMatch = html.match(/<title[^>]*>(.*?)<\/title>/i);
+  if (titleMatch) return stripHtml(titleMatch[1]);
+  
+  const h1Match = html.match(/<h1[^>]*>(.*?)<\/h1>/i);
+  if (h1Match) return stripHtml(h1Match[1]);
+  
+  return null;
+}
+
+// Extract first heading from section
+function extractFirstHeading(html) {
+  const headingMatch = html.match(/<h[1-6][^>]*>(.*?)<\/h[1-6]>/i);
+  return headingMatch ? stripHtml(headingMatch[1]) : null;
+}
+
+// Extract general content if no structure found
+function extractGeneralContent(html) {
+  const textElements = html.match(/<p[^>]*>(.*?)<\/p>/gi) || [];
+  const content = textElements
+    .map(p => stripHtml(p))
+    .filter(text => text.length > 10)
+    .join(' ')
+    .replace(/\s+/g, ' ');
+  
+  return content.length > 50 ? content : null;
+}
+
+// Extract additional URLs to crawl
+function extractAdditionalUrls(html) {
+  const urls = [];
+  const linkRegex = /<a[^>]*href=["']([^"']+)["'][^>]*>/gi;
+  let match;
+  
+  while ((match = linkRegex.exec(html)) !== null) {
+    let url = match[1];
+    
+    // Convert relative URLs to absolute
+    if (url.startsWith('/')) {
+      url = 'https://kokobrain.lovable.app' + url;
+    } else if (!url.startsWith('http')) {
+      url = 'https://kokobrain.lovable.app/' + url;
+    }
+    
+    // Only include kokobrain.lovable.app URLs
+    if (url.includes('kokobrain.lovable.app') && !urls.includes(url)) {
+      urls.push(url);
+    }
+  }
+  
+  return urls;
+}
+
+// Search through cached content
+function searchCachedContent(articles, query) {
+  if (!articles || articles.length === 0) {
+    return [];
+  }
+
   const q = query.toLowerCase();
   const results = [];
-  
-  // Enhanced parsing - look for common patterns in HTML
-  const titleRegex = /<h[1-6][^>]*>(.*?)<\/h[1-6]>/gi;
-  const linkRegex = /<a[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi;
-  const textRegex = /<p[^>]*>(.*?)<\/p>/gi;
-  
-  let match;
-  const foundContent = [];
-  
-  // Extract headings
-  while ((match = titleRegex.exec(html)) !== null) {
-    const title = match[1].replace(/<[^>]*>/g, '').trim();
-    if (title && title.toLowerCase().includes(q)) {
-      foundContent.push({
-        type: 'heading',
-        text: title,
-        relevance: 3
-      });
-    }
-  }
-  
-  // Extract links
-  let linkMatch;
-  while ((linkMatch = linkRegex.exec(html)) !== null) {
-    const url = linkMatch[1];
-    const linkText = linkMatch[2].replace(/<[^>]*>/g, '').trim();
-    if (linkText && linkText.toLowerCase().includes(q)) {
-      foundContent.push({
-        type: 'link',
-        text: linkText,
-        url: url.startsWith('http') ? url : `https://kokobrain.lovable.app${url}`,
-        relevance: 2
-      });
-    }
-  }
-  
-  // Extract paragraphs
-  let textMatch;
-  while ((textMatch = textRegex.exec(html)) !== null) {
-    const text = textMatch[1].replace(/<[^>]*>/g, '').trim();
-    if (text && text.toLowerCase().includes(q)) {
-      foundContent.push({
-        type: 'text',
-        text: text,
-        relevance: 1
-      });
-    }
-  }
-  
-  // Convert found content to article format
-  foundContent.sort((a, b) => b.relevance - a.relevance);
-  
-  for (let i = 0; i < Math.min(foundContent.length, 5); i++) {
-    const content = foundContent[i];
-    results.push({
-      title: content.text.substring(0, 60) + (content.text.length > 60 ? '...' : ''),
-      description: `Found in KokoBrain: "${content.text.substring(0, 100)}..."`,
-      url: content.url || 'https://kokobrain.lovable.app'
-    });
-  }
-  
-  return results;
-}
 
-// Fallback search with enhanced Kolet-specific articles
-function searchFallbackArticles(query) {
-  const q = query.toLowerCase();
-  
-  // Enhanced article database with more Kolet-specific content
-  const koletArticles = [
-    {
-      title: "eSIM Activation Troubleshooting Guide",
-      url: "https://kokobrain.lovable.app/esim-activation",
-      description: "Step-by-step guide for resolving eSIM activation issues and configuration problems",
-      keywords: "esim activation data sim profile install troubleshoot failure edge cases ios android setup configure"
-    },
-    {
-      title: "Data Connectivity Issues - Complete Resolution Guide",
-      url: "https://kokobrain.lovable.app/data-issues",
-      description: "Comprehensive troubleshooting for when customer data is not working or slow",
-      keywords: "data not working connectivity roaming apn settings network connection mobile slow internet"
-    },
-    {
-      title: "Refund and Cancellation Policy",
-      url: "https://kokobrain.lovable.app/refunds",
-      description: "How to process refunds, cancellations, and handle billing disputes",
-      keywords: "refund cancellation billing dispute money back cancel subscription policy"
-    },
-    {
-      title: "Account Referral System Guide",
-      url: "https://kokobrain.lovable.app/referrals",
-      description: "Understanding how referrals work, credits, and common referral issues",
-      keywords: "referral account system credits bonus friend invite share reward program"
-    },
-    {
-      title: "Edge Cases and Special Situations",
-      url: "https://kokobrain.lovable.app/edge-cases",
-      description: "Handling unusual customer scenarios and exceptional cases",
-      keywords: "edge cases unusual scenarios special situations exceptions handling guide complex"
-    },
-    {
-      title: "Installation Guide - Getting Started",
-      url: "https://kokobrain.lovable.app/installation",
-      description: "How customers install eSIM and start using their data plan",
-      keywords: "install esim data plan setup configuration activate start using guide tutorial"
-    },
-    {
-      title: "Account Management and Login Issues",
-      url: "https://kokobrain.lovable.app/account",
-      description: "Resolving login problems, password resets, and account access",
-      keywords: "account management login password reset billing subscription access locked"
-    },
-    {
-      title: "Roaming and International Data",
-      url: "https://kokobrain.lovable.app/roaming",
-      description: "How international roaming works and troubleshooting abroad",
-      keywords: "roaming international data abroad travel foreign country network"
-    },
-    {
-      title: "Device Compatibility Issues",
-      url: "https://kokobrain.lovable.app/compatibility",
-      description: "Checking device compatibility and resolving unsupported device issues",
-      keywords: "compatibility device support phone model android ios unsupported check"
+  for (const article of articles) {
+    let score = 0;
+    const searchText = article.searchText || `${article.title} ${article.content}`.toLowerCase();
+
+    // Exact phrase match in title (highest score)
+    if (article.title.toLowerCase().includes(q)) {
+      score += 100;
     }
-  ];
-  
-  // Search through enhanced articles
-  const results = koletArticles.filter(article =>
-    article.title.toLowerCase().includes(q) ||
-    article.description.toLowerCase().includes(q) ||
-    article.keywords.toLowerCase().includes(q)
-  ).slice(0, 5);
-  
-  console.log(`Fallback search found ${results.length} articles for "${query}"`);
-  return results;
+
+    // Exact phrase match in content
+    if (searchText.includes(q)) {
+      score += 50;
+    }
+
+    // Individual word matches
+    const queryWords = q.split(' ').filter(word => word.length > 2);
+    for (const word of queryWords) {
+      const wordCount = (searchText.match(new RegExp(word, 'g')) || []).length;
+      score += wordCount * 10;
+    }
+
+    if (score > 0) {
+      results.push({
+        ...article,
+        score
+      });
+    }
+  }
+
+  // Sort by score and return top 5
+  return results
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5)
+    .map(({ score, ...article }) => article);
 }
 
 function buildResultsCanvas(query, articles) {
@@ -243,7 +358,7 @@ function buildResultsCanvas(query, articles) {
   if (articles.length === 0) {
     components.push({
       type: "text",
-      text: "No articles found in KokoBrain. Try different keywords or check if the content exists.",
+      text: "No articles found in KokoBrain. The content might not be cached yet, or try different keywords.",
       style: "muted"
     });
   } else {
@@ -258,13 +373,11 @@ function buildResultsCanvas(query, articles) {
         text: article.description, 
         style: "muted" 
       });
-      if (article.url) {
-        components.push({ 
-          type: "anchor", 
-          href: article.url, 
-          text: "Open in KokoBrain →" 
-        });
-      }
+      components.push({ 
+        type: "anchor", 
+        href: article.url, 
+        text: "Open in KokoBrain →" 
+      });
       components.push({ type: "spacer", size: "s" });
     }
   }
@@ -298,4 +411,4 @@ function buildErrorCanvas() {
   };
 }
 
-app.listen(process.env.PORT || 3000, () => console.log('✅ KokoBrain live search app running'));
+app.listen(process.env.PORT || 3000, () => console.log('✅ KokoBrain intelligent search app running'));
