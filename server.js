@@ -16,7 +16,7 @@ const searchUI = {
           type: "input",
           id: "search_query",
           label: "Search",
-          placeholder: "e.g. eSIM activation, data not working, edge cases...",
+          placeholder: "e.g. eSIM activation, data not working, refund...",
           action: { type: "submit" }
         },
         {
@@ -53,71 +53,185 @@ app.post('/intercom/submit', async (req, res) => {
   }
 
   try {
-    const articles = await searchKokoBrain(query);
+    const articles = await searchKokoBrainLive(query);
     res.json({ canvas: buildResultsCanvas(query, articles) });
   } catch (err) {
-    console.error(err);
+    console.error('KokoBrain search error:', err);
     res.json({ canvas: buildErrorCanvas() });
   }
 });
 
-// Search your KokoBrain knowledge base
-async function searchKokoBrain(query) {
+// Fetch and search actual KokoBrain content
+async function searchKokoBrainLive(query) {
   try {
-    const q = query.toLowerCase();
+    console.log(`Searching KokoBrain for: "${query}"`);
     
-    // Your KokoBrain articles - expand this list with your actual content
-    const kokobrainArticles = [
-      {
-        title: "eSIM Activation Troubleshooting",
-        url: "https://kokobrain.lovable.app/esim-activation",
-        description: "Complete guide for resolving eSIM activation failures and edge cases",
-        content: "esim activation data sim profile install troubleshoot failure edge cases ios android"
-      },
-      {
-        title: "Data Connectivity Issues",
-        url: "https://kokobrain.lovable.app/data-issues", 
-        description: "Step-by-step resolution for when customer data is not working",
-        content: "data not working connectivity roaming apn settings network connection mobile"
-      },
-      {
-        title: "Referral System Guide",
-        url: "https://kokobrain.lovable.app/referrals",
-        description: "How the account referral system works and common issues",
-        content: "referral account system credits bonus friend invite share reward"
-      },
-      {
-        title: "Edge Cases Documentation",
-        url: "https://kokobrain.lovable.app/edge-cases",
-        description: "Handling unusual customer scenarios and edge cases",
-        content: "edge cases unusual scenarios special situations exceptions handling guide"
-      },
-      {
-        title: "Account Management Issues",
-        url: "https://kokobrain.lovable.app/account-management",
-        description: "Common account-related problems and solutions",
-        content: "account management login password reset billing subscription cancel"
-      },
-      {
-        title: "Installation Guide - Start Using Data",
-        url: "https://kokobrain.lovable.app/installation",
-        description: "How customers can install eSIM and start using their data plan",
-        content: "install esim data plan setup configuration activate start using guide"
+    // Fetch the main KokoBrain page
+    const response = await fetch('https://kokobrain.lovable.app', {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; Kolet-HelpCenter/1.0)'
       }
-    ];
-
-    // Search through articles
-    const results = kokobrainArticles.filter(article =>
-      article.title.toLowerCase().includes(q) ||
-      article.description.toLowerCase().includes(q) ||
-      article.content.toLowerCase().includes(q)
-    ).slice(0, 5);
-
+    });
+    
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    
+    const html = await response.text();
+    console.log('Successfully fetched KokoBrain content');
+    
+    // Extract content and search
+    const results = await parseAndSearchKokoBrain(html, query);
+    console.log(`Found ${results.length} matching articles`);
+    
     return results;
   } catch (error) {
-    console.error('KokoBrain search failed:', error);
-    return [];
+    console.error('Error fetching KokoBrain:', error);
+    
+    // Fallback to enhanced mock data based on common Kolet topics
+    return searchFallbackArticles(query);
   }
+}
+
+// Parse HTML and extract searchable content
+async function parseAndSearchKokoBrain(html, query) {
+  const q = query.toLowerCase();
+  const results = [];
+  
+  // Enhanced parsing - look for common patterns in HTML
+  const titleRegex = /<h[1-6][^>]*>(.*?)<\/h[1-6]>/gi;
+  const linkRegex = /<a[^>]*href=["']([^"']+)["'][^>]*>(.*?)<\/a>/gi;
+  const textRegex = /<p[^>]*>(.*?)<\/p>/gi;
+  
+  let match;
+  const foundContent = [];
+  
+  // Extract headings
+  while ((match = titleRegex.exec(html)) !== null) {
+    const title = match[1].replace(/<[^>]*>/g, '').trim();
+    if (title && title.toLowerCase().includes(q)) {
+      foundContent.push({
+        type: 'heading',
+        text: title,
+        relevance: 3
+      });
+    }
+  }
+  
+  // Extract links
+  let linkMatch;
+  while ((linkMatch = linkRegex.exec(html)) !== null) {
+    const url = linkMatch[1];
+    const linkText = linkMatch[2].replace(/<[^>]*>/g, '').trim();
+    if (linkText && linkText.toLowerCase().includes(q)) {
+      foundContent.push({
+        type: 'link',
+        text: linkText,
+        url: url.startsWith('http') ? url : `https://kokobrain.lovable.app${url}`,
+        relevance: 2
+      });
+    }
+  }
+  
+  // Extract paragraphs
+  let textMatch;
+  while ((textMatch = textRegex.exec(html)) !== null) {
+    const text = textMatch[1].replace(/<[^>]*>/g, '').trim();
+    if (text && text.toLowerCase().includes(q)) {
+      foundContent.push({
+        type: 'text',
+        text: text,
+        relevance: 1
+      });
+    }
+  }
+  
+  // Convert found content to article format
+  foundContent.sort((a, b) => b.relevance - a.relevance);
+  
+  for (let i = 0; i < Math.min(foundContent.length, 5); i++) {
+    const content = foundContent[i];
+    results.push({
+      title: content.text.substring(0, 60) + (content.text.length > 60 ? '...' : ''),
+      description: `Found in KokoBrain: "${content.text.substring(0, 100)}..."`,
+      url: content.url || 'https://kokobrain.lovable.app'
+    });
+  }
+  
+  return results;
+}
+
+// Fallback search with enhanced Kolet-specific articles
+function searchFallbackArticles(query) {
+  const q = query.toLowerCase();
+  
+  // Enhanced article database with more Kolet-specific content
+  const koletArticles = [
+    {
+      title: "eSIM Activation Troubleshooting Guide",
+      url: "https://kokobrain.lovable.app/esim-activation",
+      description: "Step-by-step guide for resolving eSIM activation issues and configuration problems",
+      keywords: "esim activation data sim profile install troubleshoot failure edge cases ios android setup configure"
+    },
+    {
+      title: "Data Connectivity Issues - Complete Resolution Guide",
+      url: "https://kokobrain.lovable.app/data-issues",
+      description: "Comprehensive troubleshooting for when customer data is not working or slow",
+      keywords: "data not working connectivity roaming apn settings network connection mobile slow internet"
+    },
+    {
+      title: "Refund and Cancellation Policy",
+      url: "https://kokobrain.lovable.app/refunds",
+      description: "How to process refunds, cancellations, and handle billing disputes",
+      keywords: "refund cancellation billing dispute money back cancel subscription policy"
+    },
+    {
+      title: "Account Referral System Guide",
+      url: "https://kokobrain.lovable.app/referrals",
+      description: "Understanding how referrals work, credits, and common referral issues",
+      keywords: "referral account system credits bonus friend invite share reward program"
+    },
+    {
+      title: "Edge Cases and Special Situations",
+      url: "https://kokobrain.lovable.app/edge-cases",
+      description: "Handling unusual customer scenarios and exceptional cases",
+      keywords: "edge cases unusual scenarios special situations exceptions handling guide complex"
+    },
+    {
+      title: "Installation Guide - Getting Started",
+      url: "https://kokobrain.lovable.app/installation",
+      description: "How customers install eSIM and start using their data plan",
+      keywords: "install esim data plan setup configuration activate start using guide tutorial"
+    },
+    {
+      title: "Account Management and Login Issues",
+      url: "https://kokobrain.lovable.app/account",
+      description: "Resolving login problems, password resets, and account access",
+      keywords: "account management login password reset billing subscription access locked"
+    },
+    {
+      title: "Roaming and International Data",
+      url: "https://kokobrain.lovable.app/roaming",
+      description: "How international roaming works and troubleshooting abroad",
+      keywords: "roaming international data abroad travel foreign country network"
+    },
+    {
+      title: "Device Compatibility Issues",
+      url: "https://kokobrain.lovable.app/compatibility",
+      description: "Checking device compatibility and resolving unsupported device issues",
+      keywords: "compatibility device support phone model android ios unsupported check"
+    }
+  ];
+  
+  // Search through enhanced articles
+  const results = koletArticles.filter(article =>
+    article.title.toLowerCase().includes(q) ||
+    article.description.toLowerCase().includes(q) ||
+    article.keywords.toLowerCase().includes(q)
+  ).slice(0, 5);
+  
+  console.log(`Fallback search found ${results.length} articles for "${query}"`);
+  return results;
 }
 
 function buildResultsCanvas(query, articles) {
@@ -129,7 +243,7 @@ function buildResultsCanvas(query, articles) {
   if (articles.length === 0) {
     components.push({
       type: "text",
-      text: "No articles found in KokoBrain. Try different keywords.",
+      text: "No articles found in KokoBrain. Try different keywords or check if the content exists.",
       style: "muted"
     });
   } else {
@@ -184,4 +298,4 @@ function buildErrorCanvas() {
   };
 }
 
-app.listen(process.env.PORT || 3000, () => console.log('✅ KokoBrain search app running'));
+app.listen(process.env.PORT || 3000, () => console.log('✅ KokoBrain live search app running'));
