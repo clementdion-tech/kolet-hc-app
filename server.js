@@ -14,10 +14,13 @@ let articleCache = null;
 let cacheExpiry = 0;
 const CACHE_TTL = 5 * 60 * 1000;
 
-async function fetchPageText(pageId) {
+// Recursively fetch all block text up to MAX_DEPTH levels (handles toggles, callouts, lists, tables)
+const MAX_BLOCK_DEPTH = 3;
+
+async function fetchBlocksText(blockId, depth = 0) {
   try {
     const res = await fetch(
-      `https://api.notion.com/v1/blocks/${pageId}/children?page_size=50`,
+      `https://api.notion.com/v1/blocks/${blockId}/children?page_size=100`,
       {
         headers: {
           Authorization: `Bearer ${process.env.NOTION_TOKEN}`,
@@ -27,14 +30,40 @@ async function fetchPageText(pageId) {
     );
     const data = await res.json();
     if (!res.ok) return '';
-    return (data.results || [])
-      .map(block => {
-        const type = block.type;
-        const richText = block[type]?.rich_text || [];
-        return richText.map(t => t.plain_text).join('');
-      })
-      .join(' ')
-      .toLowerCase();
+
+    let text = '';
+    const childIds = [];
+
+    for (const block of (data.results || [])) {
+      const type = block.type;
+
+      // Inline rich text (paragraphs, headings, bullets, toggles, callouts, quotes…)
+      const richText = block[type]?.rich_text || [];
+      if (richText.length) text += richText.map(t => t.plain_text).join(' ') + ' ';
+
+      // Table rows: iterate cells
+      if (type === 'table_row') {
+        for (const cell of (block.table_row?.cells || [])) {
+          text += cell.map(t => t.plain_text).join(' ') + ' ';
+        }
+      }
+
+      // Queue child blocks for next level
+      if (block.has_children && depth < MAX_BLOCK_DEPTH) {
+        childIds.push(block.id);
+      }
+    }
+
+    // Fetch children 2 at a time with a small gap to stay within Notion rate limits
+    for (let i = 0; i < childIds.length; i += 2) {
+      const results = await Promise.all(
+        childIds.slice(i, i + 2).map(id => fetchBlocksText(id, depth + 1))
+      );
+      text += results.join(' ');
+      if (i + 2 < childIds.length) await new Promise(r => setTimeout(r, 150));
+    }
+
+    return text.toLowerCase();
   } catch {
     return '';
   }
@@ -78,7 +107,7 @@ async function getArticles() {
       const pageId = page.id.replace(/-/g, '');
       const url = `https://www.notion.so/kolet/${pageId}`;
 
-      results.push({ title, category, keywords, content: '', url, pageId: page.id });
+      results.push({ title, category, keywords, content: '', extractedKeywords: '', url, pageId: page.id });
     }
 
     cursor = data.has_more ? data.next_cursor : undefined;
@@ -94,21 +123,62 @@ async function getArticles() {
   return results;
 }
 
+// Domain terms we always want to catch even if they appear only once
+const DOMAIN_TERMS = new Set([
+  'esim','sim','apn','iccid','qr','roaming','refund','invoice','wallet',
+  'koin','koins','fraud','install','activate','activation','connectivity',
+  'compatible','compatibility','profile','carrier','network','plan','bundle',
+  'expire','transfer','reassign','migrate','migration','voucher','referral',
+  'promo','miles','loyalty','partner','otp','verification','password',
+  'login','account','billing','payment','credit','balance','topup','adapter',
+  'android','iphone','pixel','samsung','huawei','xiaomi','oppo',
+  'restricted','blocked','government','vpn','zone','country','egypt','turkey',
+  'china','flying','blue','afklm','airfrance','klm','oneclick','qrcode',
+  'reimbursement','cashback','uninstall','reinstall','reactivate','disable',
+  'enabled','disabled','installed','detected','coverage','bandwidth','speed',
+  'throttle','expire','renewal','extend','top','topup','b2b','enterprise',
+]);
+
+function extractKeywordsFromContent(content) {
+  if (!content) return '';
+
+  const words = content
+    .replace(/[^\w\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 2 && !STOPWORDS.has(w));
+
+  // Frequency count
+  const freq = {};
+  for (const w of words) freq[w] = (freq[w] || 0) + 1;
+
+  // Keep domain terms + any word appearing 3+ times
+  return Object.entries(freq)
+    .filter(([w, n]) => DOMAIN_TERMS.has(w) || n >= 3)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 60)
+    .map(([w]) => w)
+    .join(' ');
+}
+
 async function enrichArticleContent(articles) {
+  let done = 0;
   for (let i = 0; i < articles.length; i += 3) {
     const batch = articles.slice(i, i + 3);
     await Promise.all(
       batch.map(async (article) => {
         if (!article.content) {
-          article.content = await fetchPageText(article.pageId);
+          article.content          = await fetchBlocksText(article.pageId);
+          article.extractedKeywords = extractKeywordsFromContent(article.content);
         }
       })
     );
-    if (i + 3 < articles.length) {
-      await new Promise(r => setTimeout(r, 300));
+    done += batch.length;
+    if (done % 15 === 0 || done === articles.length) {
+      console.log(`Enriched ${done}/${articles.length} articles`);
     }
+    if (i + 3 < articles.length) await new Promise(r => setTimeout(r, 300));
   }
-  console.log('Article content enrichment complete');
+  console.log('Knowledge base build complete');
 }
 
 // Words to ignore when scoring
@@ -212,7 +282,8 @@ function searchArticles(articles, rawQuery) {
   const scored = articles.map(article => {
     const title    = article.title.toLowerCase();
     const category = article.category.toLowerCase();
-    const keywords = article.keywords;
+    const keywords = article.keywords;                    // manual Notion keywords
+    const extkw    = article.extractedKeywords || '';     // auto-extracted knowledge base
     const content  = article.content || '';
     let score = 0;
 
@@ -221,19 +292,22 @@ function searchArticles(articles, rawQuery) {
     else if (title.includes(q)) score += 200;
     if (category.includes(q))   score += 80;
     if (keywords.includes(q))   score += 60;
-    if (content.includes(q))    score += 50;
+    if (extkw.includes(q))      score += 55;
+    if (content.includes(q))    score += 40;
 
     // Expanded term scoring across all fields
-    score += scoreText(title,    expanded, q) * 2;  // title weighted 2x
+    score += scoreText(title,    expanded, q) * 2;  // title weighted 2×
     score += scoreText(category, expanded, q);
     score += scoreText(keywords, expanded, q);
-    score += scoreText(content,  expanded, q);
+    score += scoreText(extkw,    expanded, q);       // knowledge base on par with manual keywords
+    score += scoreText(content,  expanded, q) * 0.5; // raw content lower weight (noisy)
 
     // Concept boost: phrase match confirmed the intent → heavily reward title hits
     for (const concept of boostConcepts) {
       if (title.includes(concept))    score += 200;
       if (category.includes(concept)) score += 80;
       if (keywords.includes(concept)) score += 60;
+      if (extkw.includes(concept))    score += 55;
     }
 
     // Prefix match on individual title words
@@ -958,7 +1032,23 @@ app.get('/debug/search', async (req, res) => {
   const results = searchArticles(articles, q);
   res.json({ query: q, sanitized: sanitizeQuery(q), count: results.length, results });
 });
-app.get('/health', (req, res) => res.json({ ok: true, cached: articleCache?.length || 0 }));
+app.get('/debug/kb', async (req, res) => {
+  // Inspect the knowledge base built per article
+  const articles = await getArticles();
+  const enriched = articles.filter(a => a.extractedKeywords);
+  res.json({
+    total: articles.length,
+    enriched: enriched.length,
+    articles: articles.map(a => ({
+      title: a.title,
+      category: a.category,
+      manualKeywords: a.keywords,
+      extractedKeywords: a.extractedKeywords,
+      contentLength: a.content.length,
+    })),
+  });
+});
+app.get('/health', (req, res) => res.json({ ok: true, cached: articleCache?.length || 0, enriched: articleCache?.filter(a => a.extractedKeywords).length || 0 }));
 
 getArticles().catch(err => console.error('Cache warm failed:', err.message));
 
