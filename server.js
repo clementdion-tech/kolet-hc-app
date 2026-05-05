@@ -137,6 +137,11 @@ const DOMAIN_TERMS = new Set([
   'reimbursement','cashback','uninstall','reinstall','reactivate','disable',
   'enabled','disabled','installed','detected','coverage','bandwidth','speed',
   'throttle','expire','renewal','extend','top','topup','b2b','enterprise',
+  // New from conversation analysis
+  'locate','locate esim','find esim','secondary','countdown','validity','consent',
+  'gift','donation','convert','unused','koins','koin','remaining','leftover',
+  'terms','conditions','checkbox','bezahlen','paiement','pagare','throttled',
+  'primary','data sim','primary sim','service','signal','destination',
 ]);
 
 function extractKeywordsFromContent(content) {
@@ -195,30 +200,90 @@ const STOPWORDS = new Set([
 ]);
 
 // Customer language → article terms. Each key maps to terms likely in article titles/categories.
+// Updated from real Intercom conversation analysis (May 2026).
 const SYNONYMS = {
-  refund:       ['money back','reimburse','reimbursement','cashback','cancel','cancelled'],
+  // ── Billing / money ─────────────────────────────────────────────────────
+  refund:       ['money back','reimburse','reimbursement','cashback','cancel','cancelled',
+                 'rembours','remboursement','reembolso','rimborso'],
   money:        ['refund','payment','invoice','wallet','credit','koin','koins'],
-  payment:      ['invoice','pay','paid','charge','billing','bill','receipt'],
-  invoice:      ['receipt','bill','billing','charge'],
+  payment:      ['invoice','pay','paid','charge','billing','bill','receipt',
+                 // German (very common in support: "Wie bezahlt man")
+                 'bezahlen','bezahlt','bezahle','bezahlung','zahlen','zahlung',
+                 // French / Spanish / Italian
+                 'payer','paiement','pago','pagare','betalen','apple pay','google pay',
+                 'card','carte','tarjeta','credit card'],
+  invoice:      ['receipt','bill','billing','charge','facture','factura','fattura'],
   wallet:       ['credit','credits','balance','koin','koins','top up','topup'],
-  install:      ['installation','setup','set up','activate','activation','qr','scan','add esim'],
-  transfer:     ['move','switch','reassign','new phone','new device','change device','migrate','migration'],
-  connection:   ['connect','connectivity','signal','network','no data','internet','roaming','apn'],
+
+  // ── eSIM install / setup ─────────────────────────────────────────────────
+  install:      ['installation','setup','set up','activate','activation','qr','scan','add esim',
+                 'how to install','cant install','cannot install','not installing'],
+  // NEW — "find / locate eSIM in phone settings" (different from install problems)
+  locate:       ['find my esim','cant find','cannot find','not showing','not visible','not appearing',
+                 'disappeared','where is my esim','see my esim','show esim','secondary sim',
+                 'business line','travel sim','mobile data label','which sim is kolet',
+                 'find esim','locate esim','see esim','esim not showing','esim disappeared'],
+
+  // ── Connectivity ─────────────────────────────────────────────────────────
+  connection:   ['connect','connectivity','signal','network','no data','internet','roaming','apn',
+                 'not connecting','not working','no service','no internet','not getting service'],
   internet:     ['connection','data','connectivity','apn','network'],
-  slow:         ['speed','slow connection','connectivity'],
+  slow:         ['speed','slow connection','connectivity','throttle','throttled'],
+  roaming:      ['connection','apn','network','abroad','travel','international',
+                 'johannesburg','japan','turkey','destination','when i arrive','at destination'],
+  sms:          ['otp','verification','code','text message','mms','picture message',
+                 'whatsapp','imessage','send message','receive message','phone number',
+                 'international calls','appels','llamadas'],
+
+  // ── Transfer / device change ─────────────────────────────────────────────
+  transfer:     ['move','switch','reassign','new phone','new device','change device','migrate','migration'],
+  // NEW — data gifting / donation (distinct from device transfer)
+  gift:         ['gift data','gifted','gift my gb','data donation','donate data','wrong email',
+                 'recipient','receiver','reciever','regalo','cadeau','gifted to wrong','sent to wrong'],
+
+  // ── Koins / convert unused data ──────────────────────────────────────────
+  // NEW — Koins are frequently asked about but were missing from SYNONYMS entirely
+  koins:        ['koin','kolet koins','remaining credit','in-app credit','wallet credit',
+                 'crédit restant','utiliser le crédit','use my credit','convert data',
+                 'convert unused','unused data','données inutilisées','reconvertir',
+                 'how do i use koins','use koins'],
+  // NEW — explicit "convert" intent
+  convert:      ['convert unused','convert data','convert to koins','unused data',
+                 'données inutilisées','reconvertir','remaining data','leftover data'],
+
+  // ── Account / login ──────────────────────────────────────────────────────
   login:        ['sign in','log in','otp','password','access','verification','code'],
-  account:      ['login','profile','delete','unsubscribe'],
+  account:      ['login','profile','delete','unsubscribe',
+                 // T&C consent checkbox — came up repeatedly
+                 'terms and conditions','consent','checkbox','check off','tick the box',
+                 'cgv','conditions générales','consentement','terms','conditions'],
+
+  // ── Vouchers / promo ─────────────────────────────────────────────────────
+  // Key learning: promo code VALIDITY questions are NOT fraud — separate intent
+  referral:     ['refer','invite','friend','voucher','code','promo','gift','discount','coupon'],
+  voucher:      ['referral','promo','code','gift','discount','coupon',
+                 // countdown / validity — distinct from fraud
+                 'validity','valid','expire','expiry','when does it start','quand commence',
+                 'quando inizia','codice promozionale','axa','insurance voucher',
+                 'countdown','starts when','when start'],
+
+  // ── Data plan ────────────────────────────────────────────────────────────
+  data:         ['gb','gigabyte','plan','package','usage','extend','bundle',
+                 // "ran out / expired" language
+                 'expired','plan expired','expiré','caducado','ran out','no more data',
+                 'used up','data finished','data ended'],
+
+  // ── App / device ─────────────────────────────────────────────────────────
   crash:        ['crash','bug','app','force close','not opening'],
   esim:         ['sim','profile','qr code','qr','compatible','compatibility'],
-  data:         ['gb','gigabyte','plan','package','usage','extend','bundle'],
-  blocked:      ['fraud','ban','banned','suspended','disposable','email'],
-  fraud:        ['scam','suspicious','blocked','fake','disposable'],
-  referral:     ['refer','invite','friend','voucher','code','promo','gift','discount','coupon'],
-  voucher:      ['referral','promo','code','gift','discount','coupon','expired'],
-  roaming:      ['connection','apn','network','abroad','travel','international'],
-  sms:          ['otp','verification','code','text message'],
+
+  // ── Loyalty / partners ───────────────────────────────────────────────────
   miles:        ['flying blue','afklm','air france','klm','points','loyalty','mileage'],
   partner:      ['travel partner','airline','afklm','air france','flying blue'],
+
+  // ── Fraud ────────────────────────────────────────────────────────────────
+  blocked:      ['fraud','ban','banned','suspended','disposable','email'],
+  fraud:        ['scam','suspicious','blocked','fake','disposable'],
 };
 
 function sanitizeQuery(raw) {
@@ -440,6 +505,14 @@ function getArticleHint(article, ctx) {
   if (category.includes('install') || title.includes('install') || title.includes('qr') ||
       title.includes('setup') || title.includes('set up') || title.includes('activate') ||
       title.includes('add esim')) {
+    // Key learning: if eSIM is already installed, the real issue is finding it in settings
+    if (esimInstalled && ctx.esimInstallCount >= 1) {
+      if (ctx.isIOS)
+        return 'eSIM already installed — check Settings › Mobile Data (may show as Secondary/Travel/Business)';
+      if (ctx.isAndroid)
+        return 'eSIM already installed — check Settings › Network › SIM cards';
+      return 'eSIM already installed — ask customer to check phone SIM settings';
+    }
     if (ctx.esimCompatible === false)
       return 'Check 3.2 — device not compatible';
     if (ctx.isChineseDevice)
@@ -448,14 +521,23 @@ function getArticleHint(article, ctx) {
       return 'Check 3.0 — 1-click install limit reached (3×)';
     if (ctx.esimInstallCount > 1)
       return 'Check 3.7 — eSIM previously installed on another device';
-    if (esimInstalled && ctx.dataNeverUsed && neverConnected)
-      return 'Check 3.9 — eSIM installed but not yet active';
     if (!ctx.esimIccid && !esimInstalled)
       return 'Check 3.10 — no eSIM linked to account';
-    if (esimInstalled)
-      return `eSIM status: ${ctx.esimStatus}`;
     if (esimUninstalled)
       return 'eSIM uninstalled — fresh install expected';
+  }
+
+  // ── Locate eSIM in settings (distinct from install problems) ──────────────
+  if (title.includes('find') || title.includes('locat') || title.includes('see') ||
+      title.includes('show') || title.includes('visible') || title.includes('appear')) {
+    if (esimInstalled) {
+      if (ctx.isIOS)
+        return 'eSIM installed — check Settings › Mobile Data (may show as Secondary/Travel/Business)';
+      if (ctx.isAndroid)
+        return 'eSIM installed — check Settings › Network › SIM cards (or Connections)';
+    }
+    if (!esimInstalled)
+      return 'eSIM not yet installed — may need QR scan first';
   }
 
   // ── Connection / start using / APN ────────────────────────────────────────
@@ -566,13 +648,28 @@ function getArticleHint(article, ctx) {
       return 'AF/KLM partner acquisition';
   }
 
-  // ── Referral / voucher / promo ────────────────────────────────────────────
+  // ── Referral / voucher / promo validity ──────────────────────────────────
+  // Key learning: voucher VALIDITY ("when does it start / countdown") ≠ fraud
   if (title.includes('referral') || title.includes('voucher') || title.includes('promo') ||
-      title.includes('discount') || title.includes('invite') || category.includes('referral')) {
+      title.includes('discount') || title.includes('invite') || title.includes('validity') ||
+      title.includes('valid') || category.includes('referral')) {
+    if (ctx.partnerSlug && ctx.partnerSlug.includes('axa'))
+      return 'AXA insurance voucher — countdown starts on first activation';
     if (ctx.hasReferred)
       return 'Customer has already referred friends';
     if (ctx.isNewUser)
       return 'New user — may have redeemed a referral';
+  }
+
+  // ── Koins / convert unused data ──────────────────────────────────────────
+  if (title.includes('koin') || title.includes('convert') || title.includes('unused') ||
+      title.includes('remaining') || category.includes('koin') || category.includes('convert')) {
+    if (ctx.dataExpired)
+      return 'Plan expired — conversion window may have closed';
+    if (ctx.dataNeverUsed)
+      return 'Data never used — full conversion to Koins may be possible';
+    if (ctx.planZoneLabel)
+      return `Active plan: ${ctx.planZoneLabel}`;
   }
 
   // ── B2B ───────────────────────────────────────────────────────────────────
@@ -640,10 +737,11 @@ function applyContextBoosts(allArticles, scored, ctx) {
     }
     if (esimInstalled) {
       if (category.includes('connect') || category.includes('start')) bonus +=  80;
-      // Pure install guides less relevant once installed
+      // Key learning: eSIM already installed → locate/connectivity, NOT install guides
       if (category.includes('install') &&
           !title.includes('reassign') && !title.includes('transfer') &&
-          !title.includes('move'))                                      bonus -=  30;
+          !title.includes('move'))                                      bonus -=  60;
+      if (category.includes('connect') || category.includes('start using'))  bonus += 100;
     }
     if (esimDisabled) {
       if (category.includes('connect'))                                bonus +=  60;
