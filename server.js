@@ -231,6 +231,10 @@ const SYNONYMS = {
                  'disappeared','where is my esim','see my esim','show esim','secondary sim',
                  'business line','travel sim','mobile data label','which sim is kolet',
                  'find esim','locate esim','see esim','esim not showing','esim disappeared',
+                 // Phrase variants with filler words ("the", "my", "it") between tokens
+                 "see the esim","find the esim","can't see","cant see","see it in","find it in",
+                 "doesn't show","does not show","not showing kolet","showing kolet","show kolet",
+                 "it doesn't show","it does not show","no kolet","kolet not showing",
                  // Device label confusion — eSIM shows as Plus/TIM/Orange/Proximus, not "Kolet"
                  'kolet plus','kolet tim','kolet lt','kolet sp','kolet lo','kolet orange',
                  'shows as plus','shows as tim','called plus','called tim','named plus','named tim',
@@ -326,6 +330,43 @@ const SYNONYMS = {
   fraud:        ['scam','suspicious','blocked','fake','disposable',
                  'fraudster','stolen','compromised','unauthorized','fraudulent'],
 };
+
+// Regex-based intent detection — more robust than keyword expansion for short/noisy text.
+// Works across languages by matching common patterns rather than specific words.
+function detectIntents(text) {
+  const q = (text || '').toLowerCase();
+  const intents = new Set();
+
+  // Locate eSIM in settings
+  if (/can.{0,5}(see|find|locat|spot)\b|not?.{0,5}(show|visible|appear|find)\b|ne (trouve|vois) pas|non (trovo|vedo)|no (encuentr|veo)\b|(see|find|locat).{0,20}esim|esim.{0,20}(not|ne|no).{0,15}(show|find|see|visible|appear)|where.{0,15}(is.{0,5})?(my.{0,5})?esim/.test(q))
+    intents.add('locate');
+
+  // Connectivity / no data / no internet
+  if (/(no|without|pas de|keine|sin|senza).{0,15}(internet|data|connection|service|signal|connexion|datos|verbindung)|not.{0,10}(connect|work|get data|receiv)|sos only|greyed.{0,8}out|toggle.{0,8}(grey|gray)|wifi.{0,8}off|no connection/.test(q))
+    intents.add('connection');
+
+  // Installation
+  if (/\binstall|\bsetup|\bset up|qr.{0,5}(scan|code)|scan.{0,5}qr|add.{0,5}esim|can.{0,5}t install/.test(q))
+    intents.add('install');
+
+  // Refund / money
+  if (/refund|reimburse|cashback|money back|rembours|reembolso|rimborso|want.{0,10}money/.test(q))
+    intents.add('refund');
+
+  // Transfer / new device
+  if (/(new|broken|defect|replac).{0,15}(phone|device)|reassign|factory.{0,5}reset|transfer.{0,8}esim/.test(q))
+    intents.add('transfer');
+
+  // Login / account
+  if (/\blog.{0,4}in\b|\bsign.{0,4}in\b|\botp\b|\bpassword\b|can.{0,5}t.{0,10}(access|log|sign)|delete.{0,8}account/.test(q))
+    intents.add('account');
+
+  // VoIP / calls
+  if (/\bvoip\b|\bcall\b|\bappel|\bappels\b|phone.{0,8}(call|number)|international.{0,8}call/.test(q))
+    intents.add('voip');
+
+  return intents;
+}
 
 function sanitizeQuery(raw) {
   if (!raw) return '';
@@ -733,21 +774,18 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
       .forEach(a => { injected.push({ ...a, score: baseScore }); scoredUrls.add(a.url); });
   }
 
+  // ── Step 1: hard contact-attribute signals ────────────────────────────────
   if (ctx.partnerKeyword) {
     inject(allArticles, a => a.title.toLowerCase().includes(ctx.partnerKeyword), 250);
   }
   if (ctx.fraudSuspected) {
     inject(allArticles, a => a.category.toLowerCase().includes('fraud'), 200);
   }
-  // VoIP team inbox → always surface the calling article
-  if (convCtx?.inboxName?.includes('voip') || convCtx?.tags?.some(t => t.includes('voip'))) {
+  if (ctx.esimCompatible === false) {
     inject(allArticles, a => {
       const t = a.title.toLowerCase();
-      return t.includes('voip') || t.includes('calling') || t.includes('call');
-    }, 300);
-  }
-  if (ctx.esimCompatible === false) {
-    inject(allArticles, a => a.title.toLowerCase().includes('adapter') || a.title.toLowerCase().includes('compatible'), 220);
+      return t.includes('adapter') || t.includes('compatible');
+    }, 220);
   }
   if (ctx.isRestrictedCountry) {
     inject(allArticles, a => {
@@ -758,13 +796,98 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
     }, 230);
   }
   if (ctx.hasFlyingBlue) {
-    inject(allArticles, a => a.title.toLowerCase().includes('air france') || a.title.toLowerCase().includes('flying blue'), 210);
+    inject(allArticles, a => {
+      const t = a.title.toLowerCase();
+      return t.includes('air france') || t.includes('flying blue');
+    }, 210);
   }
   if (ctx.isB2B) {
-    inject(allArticles, a => a.title.toLowerCase().includes('b2b') || a.title.toLowerCase().includes('business'), 200);
+    inject(allArticles, a => {
+      const t = a.title.toLowerCase();
+      return t.includes('b2b') || t.includes('business');
+    }, 200);
+  }
+
+  // ── Step 2: intent detection (regex + Intercom tags + inbox name) ─────────
+  // Build a combined signal string from all available conversation context
+  const tagText   = (convCtx?.tags  || []).join(' ');
+  const inboxName = (convCtx?.inboxName || '').toLowerCase();
+  const signalText = [convCtx?.text || '', inboxName, tagText].join(' ');
+  const intents = detectIntents(signalText);
+
+  // Intercom workflow tags are very high-confidence intent signals
+  if (/locat|find.{0,10}esim|request.*locat/i.test(tagText))  intents.add('locate');
+  if (/connect|start.?using|no.?internet|no.?data/i.test(tagText)) intents.add('connection');
+  if (/install|setup|qr/i.test(tagText))   intents.add('install');
+  if (/refund|billing|payment/i.test(tagText)) intents.add('refund');
+  if (/voip|call/i.test(tagText))          intents.add('voip');
+  if (/transfer|reassign|new.?device/i.test(tagText)) intents.add('transfer');
+
+  // Inbox / team name intent signals
+  if (/start.?using|locat|connect/i.test(inboxName)) {
+    intents.add('locate');
+    intents.add('connection');
+  }
+  if (/install/i.test(inboxName))  intents.add('install');
+  if (/refund|billing/i.test(inboxName)) intents.add('refund');
+  if (/voip|call/i.test(inboxName)) intents.add('voip');
+
+  // ── Step 3: inject articles for each detected intent ─────────────────────
+  if (intents.has('locate')) {
+    inject(allArticles, a => {
+      const t = a.title.toLowerCase();
+      return t.includes('find') || t.includes('locat') || t.includes('cannot find') ||
+             t.includes('see my') || t.includes('cannot see');
+    }, 320);
+  }
+  if (intents.has('connection')) {
+    inject(allArticles, a => {
+      const cat = a.category.toLowerCase();
+      const t   = a.title.toLowerCase();
+      return cat.includes('connect') || cat.includes('start using') ||
+             t.includes('apn') || t.includes('no data') || t.includes('no internet');
+    }, 300);
+  }
+  if (intents.has('install')) {
+    inject(allArticles, a => a.category.toLowerCase().includes('install'), 290);
+  }
+  if (intents.has('refund')) {
+    inject(allArticles, a => {
+      const cat = a.category.toLowerCase();
+      const t   = a.title.toLowerCase();
+      return cat.includes('refund') || cat.includes('billing') ||
+             t.includes('refund') || t.includes('reimburse');
+    }, 290);
+  }
+  if (intents.has('voip')) {
+    inject(allArticles, a => {
+      const t = a.title.toLowerCase();
+      return t.includes('voip') || t.includes('calling') || t.includes('call');
+    }, 310);
+  }
+  if (intents.has('transfer')) {
+    inject(allArticles, a => {
+      const t = a.title.toLowerCase();
+      return t.includes('reassign') || t.includes('transfer') || t.includes('new device');
+    }, 290);
   }
 
   const combined = [...scored, ...injected];
+
+  // ── Step 4: eSIM-state fallback (never return empty when we know the status) ──
+  if (combined.length === 0 && ctx.esimStatus) {
+    if (esimInstalled) {
+      inject(allArticles, a => {
+        const cat = a.category.toLowerCase();
+        const t   = a.title.toLowerCase();
+        return cat.includes('connect') || cat.includes('start using') ||
+               t.includes('find') || t.includes('locat');
+      }, 120);
+    } else if (esimUninstalled || !ctx.esimIccid) {
+      inject(allArticles, a => a.category.toLowerCase().includes('install'), 120);
+    }
+    combined.push(...injected.filter(a => !scored.some(s => s.url === a.url)));
+  }
 
   return combined.map(article => {
     let bonus = 0;
