@@ -565,7 +565,7 @@ function getArticleHint(article, ctx) {
         return 'eSIM installed — check Settings > Network > SIM cards (or Connections)';
     }
     if (!esimInstalled)
-      return 'eSIM not yet installed — may need QR scan first';
+      return 'eSIM not yet installed — use the install button in the app';
   }
 
   // ── Connection / start using / APN ────────────────────────────────────────
