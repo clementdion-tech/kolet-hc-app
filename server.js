@@ -147,6 +147,9 @@ const DOMAIN_TERMS = new Set([
   'gift','donation','convert','unused','koins','koin','remaining','leftover',
   'terms','conditions','checkbox','bezahlen','paiement','pagare','throttled',
   'primary','data sim','primary sim','service','signal','destination',
+  // VoIP / calls feature
+  'voip','call','calling','appel','appels','appeler','microphone','micro',
+  'minutes','ring','speaker','calls tab','international call',
 ]);
 
 function extractKeywordsFromContent(content) {
@@ -306,6 +309,16 @@ const SYNONYMS = {
                  'egypt','egyptian','turkey','turkish','registration','nra','btk',
                  'register phone','phone registration','blocked by government',
                  'roaming not available','restricted country'],
+
+  // ── VoIP / in-app calls ───────────────────────────────────────────────────
+  // Key learning: French customers say "appels" not "call" — must map both ways
+  call:         ['voip','calling','phone call','international call','make a call','place a call',
+                 'calls tab','microphone','micro','speaker','sound','ring','ringing','no sound',
+                 'cant hear','cannot hear','charged for call','call cost','call minutes','minutes',
+                 'appel','appels','appeler','passer un appel','appels internationaux',
+                 'how to call','kolet call','call feature','in-app call'],
+  voip:         ['call','calling','phone call','international call','appel','appels','appeler',
+                 'voice over ip','calls tab','kolet calls','call worldwide'],
 
   // ── Fraud / blocked accounts ─────────────────────────────────────────────
   blocked:      ['fraud','ban','banned','suspended','disposable','email',
@@ -703,7 +716,7 @@ function getArticleHint(article, ctx) {
   return null;
 }
 
-function applyContextBoosts(allArticles, scored, ctx) {
+function applyContextBoosts(allArticles, scored, ctx, convCtx) {
   if (!ctx) return scored.slice(0, 5);
 
   const esimInstalled   = /installed|enabled|active/.test(ctx.esimStatus);
@@ -725,6 +738,13 @@ function applyContextBoosts(allArticles, scored, ctx) {
   }
   if (ctx.fraudSuspected) {
     inject(allArticles, a => a.category.toLowerCase().includes('fraud'), 200);
+  }
+  // VoIP team inbox → always surface the calling article
+  if (convCtx?.inboxName?.includes('voip') || convCtx?.tags?.some(t => t.includes('voip'))) {
+    inject(allArticles, a => {
+      const t = a.title.toLowerCase();
+      return t.includes('voip') || t.includes('calling') || t.includes('call');
+    }, 300);
   }
   if (ctx.esimCompatible === false) {
     inject(allArticles, a => a.title.toLowerCase().includes('adapter') || a.title.toLowerCase().includes('compatible'), 220);
@@ -911,6 +931,7 @@ const CATEGORY_EMOJI_MAP = [
   [['egypt', 'turkey', 'china', 'government', 'constraint', 'vpn',
     'restricted'],                                                        '🌍'],
   [['compatible', 'compatibility', 'adapter', 'device'],                 '📱'],
+  [['voip', 'calling', 'call worldwide', 'calls tab', 'phone number'],   '📞'],
   [['app', 'crash', 'bug', 'update'],                                    '🐛'],
 ];
 
@@ -1081,7 +1102,7 @@ app.post('/intercom/initialize', async (req, res) => {
     if (augmentedQuery) {
       const articles    = await getArticles();
       const rawResults  = searchArticles(articles, augmentedQuery);
-      const suggestions = applyContextBoosts(articles, rawResults, ctx);
+      const suggestions = applyContextBoosts(articles, rawResults, ctx, convCtx);
       if (suggestions.length > 0) {
         console.log(`Suggested ${suggestions.length} articles for inbox="${convCtx.inboxName}"`);
         return res.json(buildSuggestionsCanvas(suggestions, convCtx, ctx));
