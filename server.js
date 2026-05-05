@@ -282,6 +282,9 @@ const PARTNER_TITLE_MAP = {
   'user_soft_launch': null, // internal — no partner article
 };
 
+// Countries where eSIM is blocked / heavily restricted
+const RESTRICTED_COUNTRIES = new Set(['eg','egy','egypt','tr','tur','turkey','cn','china']);
+
 function extractContactContext(body) {
   const contact = body.contact || {};
   const attrs   = contact.custom_attributes || {};
@@ -294,16 +297,47 @@ function extractContactContext(body) {
 
   const partnerSlug = (attrs.initial_referrer_partner_slug || '').toLowerCase().replace(/ /g, '_');
 
+  // Data usage: "0 bytes" or 0 means data never started
+  const consumed = String(attrs.current_plan_consumed || '').toLowerCase();
+  const dataNeverUsed = (consumed === '0 bytes' || consumed === '0' || consumed === '')
+    && !attrs.current_plan_usage_started_at
+    && !!attrs.current_plan_limit; // a plan exists
+
+  // Destination country
+  const planZone = (attrs.current_plan_zone_code || attrs.initial_gift_zone_code || '').toLowerCase();
+  const isRestrictedCountry = RESTRICTED_COUNTRIES.has(planZone);
+
   return {
-    isIOS:          !!contact.ios_device || !!contact.ios_app_version,
-    isAndroid:      !!contact.android_device || !!contact.android_app_version,
-    esimStatus,                                         // 'installed','uninstalled','enabled','disabled',''
-    esimCompatible: attrs.is_device_esim_compatible,   // true | false | null
-    fraudSuspected: attrs.fraud_suspected === true,
-    partnerSlug,                                        // e.g. 'fram', 'afklm'
-    partnerKeyword: PARTNER_TITLE_MAP[partnerSlug] ?? partnerSlug,
-    isB2B:          attrs.is_b2b === true,
-    language:       attrs.language || '',
+    // Device
+    isIOS:             !!contact.ios_device   || !!contact.ios_app_version,
+    isAndroid:         !!contact.android_device || !!contact.android_app_version,
+    deviceBrand:       (attrs.device_brand || '').toLowerCase(),
+
+    // eSIM
+    esimStatus,
+    esimCompatible:    attrs.is_device_esim_compatible,
+    esimInstallCount:  attrs.esim_installation_count || 0,
+    esimLastCountry:   attrs.esim_last_detected_country,   // null = never connected
+    isOneClick:        attrs.esim_is_one_click_installable,
+
+    // Data plan
+    dataNeverUsed,                                          // plan exists but 0 bytes consumed
+    dataExpired:       !!attrs.current_plan_expires_at && new Date(attrs.current_plan_expires_at) < new Date(),
+    planZone,
+    planZoneLabel:     (attrs.current_plan_zone_label || attrs.initial_gift_zone_label || '').toLowerCase(),
+    isRestrictedCountry,
+
+    // Partner & loyalty
+    partnerSlug,
+    partnerKeyword:    PARTNER_TITLE_MAP[partnerSlug] ?? (partnerSlug.replace(/_/g, ' ') || null),
+    hasFlyingBlue:     !!(attrs.flying_blue_number),
+
+    // Account
+    fraudSuspected:    attrs.fraud_suspected === true,
+    isB2B:             attrs.is_b2b === true,
+    isNewUser:         (attrs.user_value === 0 || attrs.user_value === null),
+    hasReferred:       attrs.has_referred === true,
+    language:          attrs.language || '',
   };
 }
 
@@ -313,27 +347,39 @@ function applyContextBoosts(allArticles, scored, ctx) {
   const esimInstalled   = /installed|enabled|active/.test(ctx.esimStatus);
   const esimUninstalled = /uninstalled|not_installed|deleted/.test(ctx.esimStatus);
   const esimDisabled    = /disabled/.test(ctx.esimStatus);
+  const neverConnected  = esimInstalled && ctx.esimLastCountry === null;
 
-  // Build a set of article URLs already in scored results
+  // Force-inject articles for strong context signals even when text score = 0
   const scoredUrls = new Set(scored.map(a => a.url));
+  const injected   = [];
 
-  // Articles to force-inject based on strong context signals (even if text score = 0)
-  const injected = [];
+  function inject(articles, filterFn, baseScore) {
+    articles.filter(a => filterFn(a) && !scoredUrls.has(a.url))
+      .forEach(a => { injected.push({ ...a, score: baseScore }); scoredUrls.add(a.url); });
+  }
 
   if (ctx.partnerKeyword) {
-    allArticles
-      .filter(a => a.title.toLowerCase().includes(ctx.partnerKeyword) && !scoredUrls.has(a.url))
-      .forEach(a => injected.push({ ...a, score: 250 }));
+    inject(allArticles, a => a.title.toLowerCase().includes(ctx.partnerKeyword), 250);
   }
   if (ctx.fraudSuspected) {
-    allArticles
-      .filter(a => a.category.toLowerCase().includes('fraud') && !scoredUrls.has(a.url))
-      .forEach(a => injected.push({ ...a, score: 180 }));
+    inject(allArticles, a => a.category.toLowerCase().includes('fraud'), 200);
   }
   if (ctx.esimCompatible === false) {
-    allArticles
-      .filter(a => (a.title.toLowerCase().includes('adapter') || a.title.toLowerCase().includes('compatible')) && !scoredUrls.has(a.url))
-      .forEach(a => injected.push({ ...a, score: 200 }));
+    inject(allArticles, a => a.title.toLowerCase().includes('adapter') || a.title.toLowerCase().includes('compatible'), 220);
+  }
+  if (ctx.isRestrictedCountry) {
+    inject(allArticles, a => {
+      const t = a.title.toLowerCase();
+      return t.includes('egyptian') || t.includes('turkish') ||
+             (t.includes('blocked') && t.includes('government')) ||
+             t.includes('constraint');
+    }, 230);
+  }
+  if (ctx.hasFlyingBlue) {
+    inject(allArticles, a => a.title.toLowerCase().includes('air france') || a.title.toLowerCase().includes('flying blue'), 210);
+  }
+  if (ctx.isB2B) {
+    inject(allArticles, a => a.title.toLowerCase().includes('b2b') || a.title.toLowerCase().includes('business'), 200);
   }
 
   const combined = [...scored, ...injected];
@@ -343,35 +389,85 @@ function applyContextBoosts(allArticles, scored, ctx) {
     const title    = article.title.toLowerCase();
     const category = article.category.toLowerCase();
 
+    // --- eSIM status signals ---
     if (esimUninstalled) {
-      if (category.includes('install'))                                  bonus += 150;
-      if (category.includes('connect') || category.includes('start'))   bonus -=  20;
+      if (category.includes('install'))                                bonus += 150;
+      if (category.includes('connect') || category.includes('start')) bonus -=  20;
     }
     if (esimInstalled) {
-      if (category.includes('connect') || category.includes('start'))   bonus +=  80;
+      if (category.includes('connect') || category.includes('start')) bonus +=  80;
+      // Pure install guides less relevant once installed
       if (category.includes('install') &&
           !title.includes('reassign') && !title.includes('transfer') &&
-          !title.includes('move'))                                        bonus -=  30;
+          !title.includes('move'))                                      bonus -=  30;
     }
     if (esimDisabled) {
-      if (category.includes('connect'))                                  bonus +=  60;
-      if (category.includes('account'))                                  bonus +=  40;
+      if (category.includes('connect'))                                bonus +=  60;
+      if (category.includes('account'))                                bonus +=  40;
     }
-    if (ctx.esimCompatible === false) {
-      if (title.includes('adapter') || title.includes('compatible'))    bonus += 200;
+
+    // --- Data never used (plan exists but 0 bytes consumed) ---
+    if (ctx.dataNeverUsed && esimInstalled) {
+      if (category.includes('start using'))                            bonus += 120;
+      if (title.includes('apn'))                                       bonus += 100;
+      if (title.includes('activate') || title.includes('connect'))     bonus +=  80;
+      if (category.includes('connect'))                                bonus +=  60;
     }
+
+    // --- eSIM installed but never detected by network ---
+    if (neverConnected) {
+      if (category.includes('connect'))                                bonus +=  70;
+      if (title.includes('apn'))                                       bonus +=  60;
+    }
+
+    // --- Multiple installs → reassignment/transfer articles ---
+    if (ctx.esimInstallCount > 1) {
+      if (title.includes('reassign') || title.includes('move') || title.includes('transfer')) bonus += 80;
+    }
+
+    // --- Data expired ---
+    if (ctx.dataExpired) {
+      if (title.includes('extend') || title.includes('renew'))         bonus += 100;
+      if (category.includes('money'))                                  bonus +=  40;
+    }
+
+    // --- Restricted country ---
+    if (ctx.isRestrictedCountry) {
+      if (title.includes('egyptian') || title.includes('turkish') ||
+          (title.includes('blocked') && title.includes('government'))) bonus += 230;
+      if (title.includes('constraint'))                                bonus += 150;
+    }
+
+    // --- Partner ---
     if (ctx.partnerKeyword) {
-      if (title.includes(ctx.partnerKeyword))                           bonus += 250;
-      else if (category.includes('travel partner'))                     bonus +=  40;
+      if (title.includes(ctx.partnerKeyword))                          bonus += 250;
+      else if (category.includes('travel partner'))                    bonus +=  40;
     }
+
+    // --- Flying Blue ---
+    if (ctx.hasFlyingBlue) {
+      if (title.includes('air france') || title.includes('flying blue') ||
+          title.includes('afklm'))                                     bonus += 200;
+      if (title.includes('miles') || title.includes('points'))        bonus +=  80;
+    }
+
+    // --- Fraud ---
     if (ctx.fraudSuspected) {
-      if (category.includes('fraud'))                                   bonus += 180;
+      if (category.includes('fraud'))                                  bonus += 200;
     }
+
+    // --- B2B ---
     if (ctx.isB2B) {
-      if (title.includes('b2b') || title.includes('business'))         bonus += 150;
+      if (title.includes('b2b') || title.includes('business'))        bonus += 180;
     }
-    if (ctx.isAndroid && title.includes('pixel'))                       bonus +=  60;
-    if (ctx.isIOS    && title.includes('pixel'))                        bonus -=  40;
+
+    // --- Device specifics ---
+    if (ctx.isAndroid) {
+      if (title.includes('pixel') || title.includes('android'))       bonus +=  60;
+    }
+    if (ctx.isIOS) {
+      if (title.includes('pixel'))                                     bonus -=  40;
+    }
 
     return { ...article, score: Math.max(0, article.score + bonus) };
   })
