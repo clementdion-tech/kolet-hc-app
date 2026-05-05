@@ -183,16 +183,14 @@ function extractConversationText(body) {
 
 // --- Canvas builders ---
 
-function searchInputComponents(prefill = '') {
+function searchInputComponents() {
   return [
     { type: "divider" },
-    { type: "text", text: "Search articles", style: "muted" },
     {
       type: "input",
       id: "search_query",
-      label: "",
-      placeholder: "e.g. refund, no connection, eSIM...",
-      value: prefill,
+      label: "Search KokoBrain",
+      placeholder: "refund, no connection, eSIM...",
       action: { type: "submit" }
     },
     {
@@ -211,22 +209,8 @@ const searchOnlyCanvas = {
     content: {
       components: [
         { type: "text", text: "KokoBrain", style: "header" },
-        { type: "text", text: "Find internal knowledge articles", style: "muted" },
-        { type: "spacer", size: "s" },
-        {
-          type: "input",
-          id: "search_query",
-          label: "Search",
-          placeholder: "e.g. refund, no connection, eSIM install...",
-          action: { type: "submit" }
-        },
-        {
-          type: "button",
-          id: "search_btn",
-          label: "Search KokoBrain",
-          style: "primary",
-          action: { type: "submit" }
-        }
+        { type: "text", text: "Internal knowledge base", style: "muted" },
+        ...searchInputComponents()
       ]
     }
   }
@@ -238,27 +222,25 @@ function buildResultsCanvas(headerText, articles) {
   ];
 
   if (articles.length === 0) {
-    components.push({ type: "divider" });
     components.push({ type: "text", text: "No articles found.", style: "muted" });
   } else {
     for (let i = 0; i < articles.length; i++) {
       const article = articles[i];
       components.push({ type: "divider" });
       if (article.category) {
-        components.push({ type: "text", text: article.category.toUpperCase(), style: "muted" });
+        components.push({ type: "text", text: article.category, style: "muted" });
       }
-      components.push({ type: "text", text: article.title, style: "header" });
+      components.push({ type: "text", text: article.title, style: "paragraph" });
       components.push({
         type: "button",
         id: `open_${i}`,
-        label: "Open in Notion",
+        label: "Open article →",
         style: "secondary",
         action: { type: "url", url: article.url }
       });
     }
   }
 
-  // Always show search at the bottom
   components.push(...searchInputComponents());
 
   return {
