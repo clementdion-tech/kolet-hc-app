@@ -556,9 +556,7 @@ function getArticleHint(article, ctx) {
     if (ctx.dataExpired)
       return 'Data plan expired — renewal needed before reconnecting';
     if (esimDisabled)
-      return `eSIM disabled (status: ${ctx.esimStatus})`;
-    if (ctx.planZoneLabel)
-      return `Current destination zone: ${ctx.planZoneLabel}`;
+      return 'eSIM disabled — check account status';
     if (ctx.isAndroid)
       return 'Android device — check roaming + Kolet as primary data SIM';
   }
@@ -618,17 +616,13 @@ function getArticleHint(article, ctx) {
       return 'Current plan expired — renewal needed';
     if (ctx.dataNeverUsed)
       return 'Current plan active but never used';
-    if (ctx.planZoneLabel)
-      return `Active zone: ${ctx.planZoneLabel}`;
   }
 
   // ── Restricted country / government block ────────────────────────────────
   if (title.includes('egyptian') || title.includes('turkish') || title.includes('china') ||
       title.includes('government') || title.includes('constraint') || title.includes('vpn')) {
     if (ctx.isRestrictedCountry)
-      return `Customer destination: ${ctx.planZone.toUpperCase()} — matches this restriction`;
-    if (ctx.planZone)
-      return `Customer zone: ${ctx.planZone.toUpperCase()}`;
+      return `Destination: ${ctx.planZone.toUpperCase()} — government restrictions likely apply`;
   }
 
   // ── Partner articles ──────────────────────────────────────────────────────
@@ -668,8 +662,6 @@ function getArticleHint(article, ctx) {
       return 'Plan expired — conversion window may have closed';
     if (ctx.dataNeverUsed)
       return 'Data never used — full conversion to Koins may be possible';
-    if (ctx.planZoneLabel)
-      return `Active plan: ${ctx.planZoneLabel}`;
   }
 
   // ── B2B ───────────────────────────────────────────────────────────────────
