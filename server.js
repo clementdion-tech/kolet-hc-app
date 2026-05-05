@@ -185,7 +185,6 @@ function extractConversationText(body) {
 
 function searchInputComponents() {
   return [
-    { type: "divider" },
     {
       type: "input",
       id: "search_query",
@@ -203,21 +202,53 @@ function searchInputComponents() {
   ];
 }
 
+function buildSuggestionsCanvas(articles, convQuery) {
+  const components = [
+    ...searchInputComponents(),
+    { type: "divider" },
+    { type: "text", text: "Suggested articles", style: "header" },
+  ];
+
+  for (let i = 0; i < articles.length; i++) {
+    const article = articles[i];
+    components.push({ type: "divider" });
+    if (article.category) {
+      components.push({ type: "text", text: article.category, style: "muted" });
+    }
+    components.push({
+      type: "button",
+      id: `open_${i}`,
+      label: article.title,
+      style: "link",
+      action: { type: "url", url: article.url }
+    });
+  }
+
+  return {
+    canvas: {
+      stored_data: { conv_query: convQuery },
+      content: { components }
+    }
+  };
+}
+
 const searchOnlyCanvas = {
   canvas: {
     stored_data: {},
     content: {
       components: [
-        { type: "text", text: "KokoBrain", style: "header" },
-        { type: "text", text: "Internal knowledge base", style: "muted" },
-        ...searchInputComponents()
+        ...searchInputComponents(),
+        { type: "divider" },
+        { type: "text", text: "Type a keyword above to find articles", style: "muted" },
       ]
     }
   }
 };
 
-function buildResultsCanvas(headerText, articles) {
+function buildResultsCanvas(headerText, articles, convQuery) {
   const components = [
+    ...searchInputComponents(),
+    { type: "divider" },
     { type: "text", text: headerText, style: "header" },
   ];
 
@@ -240,11 +271,21 @@ function buildResultsCanvas(headerText, articles) {
     }
   }
 
-  components.push(...searchInputComponents());
+  // Back to suggestions only if there was a conversation context
+  if (convQuery) {
+    components.push({ type: "divider" });
+    components.push({
+      type: "button",
+      id: "back_btn",
+      label: "← Back to suggestions",
+      style: "secondary",
+      action: { type: "submit" }
+    });
+  }
 
   return {
     canvas: {
-      stored_data: {},
+      stored_data: { conv_query: convQuery || '' },
       content: { components }
     }
   };
@@ -282,7 +323,7 @@ app.post('/intercom/initialize', async (req, res) => {
       const suggestions = searchArticles(articles, convText);
       if (suggestions.length > 0) {
         console.log(`Auto-suggested ${suggestions.length} articles for: "${convText.slice(0, 80)}"`);
-        return res.json(buildResultsCanvas('Suggested articles', suggestions));
+        return res.json(buildSuggestionsCanvas(suggestions, convText));
       }
     } catch (err) {
       console.error('Auto-suggest error:', err.message);
@@ -298,10 +339,23 @@ app.post('/intercom/submit', async (req, res) => {
   console.log('SUBMIT input_values:', JSON.stringify(req.body.input_values));
 
   const componentId = req.body.component_id || '';
+  const storedConvQuery = req.body.canvas_data?.stored_data?.conv_query || '';
 
-  // URL buttons open Notion directly — Intercom still calls submit, return current search
+  // URL buttons open Notion directly — no state change needed
   if (componentId.startsWith('open_')) {
-    return res.json(searchOnlyCanvas);
+    return res.status(200).end();
+  }
+
+  // Back to suggestions
+  if (componentId === 'back_btn' && storedConvQuery) {
+    try {
+      const articles = await getArticles();
+      const suggestions = searchArticles(articles, storedConvQuery);
+      return res.json(buildSuggestionsCanvas(suggestions, storedConvQuery));
+    } catch (err) {
+      console.error('Back error:', err.message);
+      return res.json(searchOnlyCanvas);
+    }
   }
 
   const rawQuery = req.body.input_values?.search_query;
@@ -317,7 +371,7 @@ app.post('/intercom/submit', async (req, res) => {
     const articles = await getArticles();
     const results = searchArticles(articles, query);
     console.log(`Found ${results.length} results for "${query}"`);
-    return res.json(buildResultsCanvas(`Results for "${query}"`, results));
+    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery));
   } catch (err) {
     console.error('Search error:', err.message);
     return res.json(buildErrorCanvas());
