@@ -680,21 +680,50 @@ function extractConversationContext(body) {
   return { text, inboxName, tags, topic };
 }
 
-// Build augmented search query: thread text + inbox + tags + topic
+// Build augmented search query: thread text + inbox name + topic (no tags)
 function buildConvSearchQuery(convCtx) {
-  return [convCtx.text, convCtx.inboxName, ...convCtx.tags, convCtx.topic]
+  return [convCtx.text, convCtx.inboxName, convCtx.topic]
     .filter(Boolean)
     .join(' ');
 }
 
-// One-liner shown to the agent so they know what drove the suggestions
+// One-liner shown to the agent ("Based on: Installation Issues")
 function buildConvContextLabel(convCtx) {
   if (!convCtx) return null;
   const parts = [];
   if (convCtx.inboxName) parts.push(convCtx.inboxName);
-  convCtx.tags.forEach(t => parts.push(`#${t}`));
   if (convCtx.topic) parts.push(convCtx.topic);
   return parts.length ? `Based on: ${parts.join(' · ')}` : null;
+}
+
+// Emoji per article category / title keyword
+const CATEGORY_EMOJI_MAP = [
+  [['install', 'activation', 'activate', 'qr', 'set up', 'add esim'],   '📲'],
+  [['connect', 'connection', 'signal', 'apn', 'internet', 'roaming',
+    'no data', 'start using'],                                            '📡'],
+  [['refund', 'reimburse', 'cashback', 'billing', 'invoice', 'payment',
+    'money', 'wallet', 'koin'],                                           '💰'],
+  [['account', 'login', 'sign in', 'otp', 'password', 'delete account'], '🔑'],
+  [['fraud', 'ban', 'suspend', 'blocked', 'disposable'],                 '🚨'],
+  [['transfer', 'reassign', 'move esim', 'new device', 'new phone',
+    'change device', 'migrate'],                                          '🔄'],
+  [['extend', 'renew', 'top up', 'bundle', 'data plan', 'gb', 'usage'],  '📦'],
+  [['flying blue', 'air france', 'afklm', 'miles', 'loyalty', 'points'], '✈️'],
+  [['partner', 'travel partner', 'kiwi', 'singapore', 'transavia'],      '🤝'],
+  [['referral', 'voucher', 'promo', 'discount', 'invite', 'gift'],       '🎁'],
+  [['b2b', 'business', 'enterprise'],                                    '🏢'],
+  [['egypt', 'turkey', 'china', 'government', 'constraint', 'vpn',
+    'restricted'],                                                        '🌍'],
+  [['compatible', 'compatibility', 'adapter', 'device'],                 '📱'],
+  [['app', 'crash', 'bug', 'update'],                                    '🐛'],
+];
+
+function getArticleEmoji(article) {
+  const haystack = (article.category + ' ' + article.title).toLowerCase();
+  for (const [keywords, emoji] of CATEGORY_EMOJI_MAP) {
+    if (keywords.some(k => haystack.includes(k))) return emoji;
+  }
+  return '📄';
 }
 
 // --- Canvas builders ---
@@ -741,7 +770,7 @@ function buildSuggestionsCanvas(articles, convCtx, ctx) {
     components.push({
       type: "button",
       id: `open_${i}`,
-      label: article.title,
+      label: `${getArticleEmoji(article)} ${article.title}`,
       style: "link",
       action: { type: "url", url: article.url }
     });
