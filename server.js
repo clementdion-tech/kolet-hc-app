@@ -642,19 +642,59 @@ function applyContextBoosts(allArticles, scored, ctx) {
     .slice(0, 5);
 }
 
-function extractConversationText(body) {
+// Extract ALL conversation text + structural signals (inbox, tags, topic)
+function extractConversationContext(body) {
   const conv = body.conversation || {};
-  const parts = [
+
+  // Collect every text chunk in the thread
+  const textParts = [
     conv.source?.subject,
     conv.source?.body,
     conv.first_contact_reply?.body,
-  ].filter(Boolean);
-
-  return parts
+  ];
+  for (const part of (conv.conversation_parts?.conversation_parts || [])) {
+    if (part.body) textParts.push(part.body);
+  }
+  const text = textParts
+    .filter(Boolean)
     .join(' ')
     .replace(/<[^>]*>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+
+  // Team inbox name — strongest single signal (e.g. "Installation Issues")
+  const inboxName = (
+    conv.assignee?.name ||
+    conv.team_assignee?.name ||
+    ''
+  ).toLowerCase().trim();
+
+  // Conversation tags (e.g. ["refund", "android"])
+  const tags = (conv.tags?.tags || [])
+    .map(t => (t.name || '').toLowerCase())
+    .filter(Boolean);
+
+  // Conversation topic if set
+  const topic = (conv.conversation_topic?.name || '').toLowerCase().trim();
+
+  return { text, inboxName, tags, topic };
+}
+
+// Build augmented search query: thread text + inbox + tags + topic
+function buildConvSearchQuery(convCtx) {
+  return [convCtx.text, convCtx.inboxName, ...convCtx.tags, convCtx.topic]
+    .filter(Boolean)
+    .join(' ');
+}
+
+// One-liner shown to the agent so they know what drove the suggestions
+function buildConvContextLabel(convCtx) {
+  if (!convCtx) return null;
+  const parts = [];
+  if (convCtx.inboxName) parts.push(convCtx.inboxName);
+  convCtx.tags.forEach(t => parts.push(`#${t}`));
+  if (convCtx.topic) parts.push(convCtx.topic);
+  return parts.length ? `Based on: ${parts.join(' · ')}` : null;
 }
 
 // --- Canvas builders ---
@@ -678,12 +718,18 @@ function searchInputComponents() {
   ];
 }
 
-function buildSuggestionsCanvas(articles, convQuery, ctx) {
+function buildSuggestionsCanvas(articles, convCtx, ctx) {
+  const contextLabel = buildConvContextLabel(convCtx);
+
   const components = [
     ...searchInputComponents(),
     { type: "divider" },
     { type: "text", text: "Suggested articles", style: "header" },
   ];
+
+  if (contextLabel) {
+    components.push({ type: "text", text: contextLabel, style: "muted" });
+  }
 
   for (let i = 0; i < articles.length; i++) {
     const article = articles[i];
@@ -706,7 +752,7 @@ function buildSuggestionsCanvas(articles, convQuery, ctx) {
 
   return {
     canvas: {
-      stored_data: { conv_query: convQuery, ctx: ctx || null },
+      stored_data: { conv_ctx: convCtx || null, ctx: ctx || null },
       content: { components }
     }
   };
@@ -725,7 +771,7 @@ const searchOnlyCanvas = {
   }
 };
 
-function buildResultsCanvas(headerText, articles, convQuery, ctx) {
+function buildResultsCanvas(headerText, articles, convCtx, ctx) {
   const components = [
     ...searchInputComponents(),
     { type: "divider" },
@@ -756,7 +802,7 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx) {
   }
 
   // Back to suggestions only if there was a conversation context
-  if (convQuery) {
+  if (convCtx) {
     components.push({ type: "divider" });
     components.push({
       type: "button",
@@ -769,7 +815,7 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx) {
 
   return {
     canvas: {
-      stored_data: { conv_query: convQuery || '', ctx: ctx || null },
+      stored_data: { conv_ctx: convCtx || null, ctx: ctx || null },
       content: { components }
     }
   };
@@ -795,23 +841,24 @@ app.get('/intercom/initialize', (req, res) => res.json(searchOnlyCanvas));
 
 app.post('/intercom/initialize', async (req, res) => {
   lastInit = req.body;
-  console.log('INIT component_id:', req.body.component_id);
-  console.log('INIT input_values:', JSON.stringify(req.body.input_values));
-  console.log('INIT conversation text:', extractConversationText(req.body).slice(0, 200));
 
-  const convText = extractConversationText(req.body);
+  const convCtx = extractConversationContext(req.body);
+  const ctx     = extractContactContext(req.body);
 
-  const ctx = extractContactContext(req.body);
-  console.log('Context:', JSON.stringify(ctx));
+  console.log('INIT inbox:', convCtx.inboxName, '| tags:', convCtx.tags, '| topic:', convCtx.topic);
+  console.log('INIT text (first 200):', convCtx.text.slice(0, 200));
+  console.log('INIT contact ctx:', JSON.stringify(ctx));
 
-  if (convText) {
+  const augmentedQuery = buildConvSearchQuery(convCtx);
+
+  if (augmentedQuery) {
     try {
-      const articles = await getArticles();
-      const rawResults = searchArticles(articles, convText);
+      const articles    = await getArticles();
+      const rawResults  = searchArticles(articles, augmentedQuery);
       const suggestions = applyContextBoosts(articles, rawResults, ctx);
       if (suggestions.length > 0) {
-        console.log(`Auto-suggested ${suggestions.length} articles (with context boosts)`);
-        return res.json(buildSuggestionsCanvas(suggestions, convText, ctx));
+        console.log(`Suggested ${suggestions.length} articles | inbox="${convCtx.inboxName}" tags=[${convCtx.tags}]`);
+        return res.json(buildSuggestionsCanvas(suggestions, convCtx, ctx));
       }
     } catch (err) {
       console.error('Auto-suggest error:', err.message);
@@ -826,23 +873,26 @@ app.post('/intercom/submit', async (req, res) => {
   console.log('SUBMIT component_id:', req.body.component_id);
   console.log('SUBMIT input_values:', JSON.stringify(req.body.input_values));
 
-  const componentId    = req.body.component_id || '';
-  const storedData     = req.body.canvas_data?.stored_data || {};
-  const storedConvQuery = storedData.conv_query || '';
-  const storedCtx      = storedData.ctx || null;
+  const componentId  = req.body.component_id || '';
+  const storedData   = req.body.canvas_data?.stored_data || {};
+  // Support both new format (conv_ctx object) and legacy format (conv_query string)
+  const storedConvCtx = storedData.conv_ctx ||
+    (storedData.conv_query ? { text: storedData.conv_query, inboxName: '', tags: [], topic: '' } : null);
+  const storedCtx    = storedData.ctx || null;
 
   // URL buttons open Notion directly — no state change needed
   if (componentId.startsWith('open_')) {
     return res.status(200).end();
   }
 
-  // Back to suggestions
-  if (componentId === 'back_btn' && storedConvQuery) {
+  // Back to suggestions — rebuild with same augmented query
+  if (componentId === 'back_btn' && storedConvCtx) {
     try {
-      const articles = await getArticles();
-      const rawResults = searchArticles(articles, storedConvQuery);
+      const augmented  = buildConvSearchQuery(storedConvCtx);
+      const articles   = await getArticles();
+      const rawResults = searchArticles(articles, augmented);
       const suggestions = applyContextBoosts(articles, rawResults, storedCtx);
-      return res.json(buildSuggestionsCanvas(suggestions, storedConvQuery, storedCtx));
+      return res.json(buildSuggestionsCanvas(suggestions, storedConvCtx, storedCtx));
     } catch (err) {
       console.error('Back error:', err.message);
       return res.json(searchOnlyCanvas);
@@ -850,7 +900,7 @@ app.post('/intercom/submit', async (req, res) => {
   }
 
   const rawQuery = req.body.input_values?.search_query;
-  const query = sanitizeQuery(rawQuery);
+  const query    = sanitizeQuery(rawQuery);
 
   console.log(`Raw query: "${rawQuery}" → sanitized: "${query}"`);
 
@@ -859,11 +909,11 @@ app.post('/intercom/submit', async (req, res) => {
   }
 
   try {
-    const articles = await getArticles();
+    const articles   = await getArticles();
     const rawResults = searchArticles(articles, query);
-    const results = applyContextBoosts(articles, rawResults, storedCtx);
-    console.log(`Found ${results.length} results for "${query}" (context: esim=${storedCtx?.esimStatus}, partner=${storedCtx?.partnerSlug})`);
-    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery, storedCtx));
+    const results    = applyContextBoosts(articles, rawResults, storedCtx);
+    console.log(`Found ${results.length} results for "${query}" (esim=${storedCtx?.esimStatus}, partner=${storedCtx?.partnerSlug})`);
+    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvCtx, storedCtx));
   } catch (err) {
     console.error('Search error:', err.message);
     return res.json(buildErrorCanvas());
