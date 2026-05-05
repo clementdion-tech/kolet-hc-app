@@ -464,10 +464,13 @@ function getArticleHint(article, ctx) {
       title.includes('internet') || title.includes('roaming') || title.includes('signal')) {
     if (ctx.isRestrictedCountry)
       return `Destination: ${ctx.planZone.toUpperCase()} — government restrictions may apply`;
-    if (ctx.dataNeverUsed && esimInstalled)
-      return 'eSIM installed — data never used, check APN';
+    if (ctx.dataNeverUsed && esimInstalled) {
+      if (title.includes('apn'))
+        return 'eSIM installed — verify APN settings';
+      return 'Check: roaming enabled + Kolet set as primary data SIM';
+    }
     if (neverConnected)
-      return 'eSIM installed but never detected by network';
+      return 'Check: roaming enabled + Kolet set as primary data SIM';
     if (ctx.dataExpired)
       return 'Data plan expired — renewal needed before reconnecting';
     if (esimDisabled)
@@ -475,7 +478,7 @@ function getArticleHint(article, ctx) {
     if (ctx.planZoneLabel)
       return `Current destination zone: ${ctx.planZoneLabel}`;
     if (ctx.isAndroid)
-      return 'Android device — APN may need manual setup';
+      return 'Android device — check roaming + Kolet as primary data SIM';
   }
 
   // ── Refund / billing / invoice ────────────────────────────────────────────
