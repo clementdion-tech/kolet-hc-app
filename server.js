@@ -230,12 +230,11 @@ function buildResultsCanvas(headerText, articles) {
       if (article.category) {
         components.push({ type: "text", text: article.category, style: "muted" });
       }
-      components.push({ type: "text", text: article.title, style: "paragraph" });
       components.push({
         type: "button",
         id: `open_${i}`,
-        label: "Open article →",
-        style: "secondary",
+        label: article.title,
+        style: "link",
         action: { type: "url", url: article.url }
       });
     }
