@@ -948,7 +948,7 @@ function buildSuggestionsCanvas(articles, convCtx, ctx) {
 
   return {
     canvas: {
-      stored_data: { conv_ctx: convCtx || null, ctx: ctx || null },
+      stored_data: { conv_query: convCtx ? buildConvSearchQuery(convCtx).slice(0, 400) : '', ctx: ctx || null },
       content: { components }
     }
   };
@@ -967,7 +967,7 @@ const searchOnlyCanvas = {
   }
 };
 
-function buildResultsCanvas(headerText, articles, convCtx, ctx) {
+function buildResultsCanvas(headerText, articles, convQuery, ctx) {
   const components = [
     ...searchInputComponents(),
     { type: "divider" },
@@ -998,7 +998,7 @@ function buildResultsCanvas(headerText, articles, convCtx, ctx) {
   }
 
   // Back to suggestions only if there was a conversation context
-  if (convCtx) {
+  if (convQuery) {
     components.push({ type: "divider" });
     components.push({
       type: "button",
@@ -1011,7 +1011,7 @@ function buildResultsCanvas(headerText, articles, convCtx, ctx) {
 
   return {
     canvas: {
-      stored_data: { conv_ctx: convCtx || null, ctx: ctx || null },
+      stored_data: { conv_query: convQuery || '', ctx: ctx || null },
       content: { components }
     }
   };
@@ -1069,26 +1069,25 @@ app.post('/intercom/submit', async (req, res) => {
   console.log('SUBMIT component_id:', req.body.component_id);
   console.log('SUBMIT input_values:', JSON.stringify(req.body.input_values));
 
-  const componentId  = req.body.component_id || '';
-  const storedData   = req.body.canvas_data?.stored_data || {};
-  // Support both new format (conv_ctx object) and legacy format (conv_query string)
-  const storedConvCtx = storedData.conv_ctx ||
-    (storedData.conv_query ? { text: storedData.conv_query, inboxName: '', tags: [], topic: '' } : null);
-  const storedCtx    = storedData.ctx || null;
+  const componentId    = req.body.component_id || '';
+  const storedData     = req.body.canvas_data?.stored_data || {};
+  const storedConvQuery = storedData.conv_query || '';
+  const storedCtx      = storedData.ctx || null;
 
   // URL buttons open Notion directly — no state change needed
   if (componentId.startsWith('open_')) {
     return res.status(200).end();
   }
 
-  // Back to suggestions — rebuild with same augmented query
-  if (componentId === 'back_btn' && storedConvCtx) {
+  // Back to suggestions — re-run stored query with same context
+  if (componentId === 'back_btn' && storedConvQuery) {
     try {
-      const augmented  = buildConvSearchQuery(storedConvCtx);
-      const articles   = await getArticles();
-      const rawResults = searchArticles(articles, augmented);
+      const articles    = await getArticles();
+      const rawResults  = searchArticles(articles, storedConvQuery);
       const suggestions = applyContextBoosts(articles, rawResults, storedCtx);
-      return res.json(buildSuggestionsCanvas(suggestions, storedConvCtx, storedCtx));
+      // Reconstruct a minimal convCtx so the label still shows inbox name if present
+      const backConvCtx = { text: storedConvQuery, inboxName: '', tags: [], topic: '' };
+      return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx));
     } catch (err) {
       console.error('Back error:', err.message);
       return res.json(searchOnlyCanvas);
@@ -1109,7 +1108,8 @@ app.post('/intercom/submit', async (req, res) => {
     const rawResults = searchArticles(articles, query);
     const results    = applyContextBoosts(articles, rawResults, storedCtx);
     console.log(`Found ${results.length} results for "${query}" (esim=${storedCtx?.esimStatus}, partner=${storedCtx?.partnerSlug})`);
-    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvCtx, storedCtx));
+    // Pass storedConvQuery as a flag — if non-empty, back button appears
+    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery || null, storedCtx));
   } catch (err) {
     console.error('Search error:', err.message);
     return res.json(buildErrorCanvas());
