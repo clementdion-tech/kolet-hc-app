@@ -111,49 +111,136 @@ async function enrichArticleContent(articles) {
   console.log('Article content enrichment complete');
 }
 
+// Words to ignore when scoring
+const STOPWORDS = new Set([
+  'i','my','me','we','us','you','he','she','they','it','its',
+  'the','a','an','and','or','but','if','in','on','at','to','for',
+  'of','with','by','from','as','is','are','was','were','be','been',
+  'being','have','has','had','do','does','did','will','would','could',
+  'should','may','might','not','no','so','than','too','very','just',
+  'this','that','these','those','what','which','who','how','when',
+  'where','why','get','got','can','also','please','help','hi','hello',
+  'need','want','still','already','now','then','about','more','some',
+  'am','im','ive','dont','cant','wont','isnt','arent','wasnt',
+]);
+
+// Customer language → article terms. Each key maps to terms likely in article titles/categories.
+const SYNONYMS = {
+  refund:       ['money back','reimburse','reimbursement','cashback','cancel','cancelled'],
+  money:        ['refund','payment','invoice','wallet','credit','koin','koins'],
+  payment:      ['invoice','pay','paid','charge','billing','bill','receipt'],
+  invoice:      ['receipt','bill','billing','charge'],
+  wallet:       ['credit','credits','balance','koin','koins','top up','topup'],
+  install:      ['installation','setup','set up','activate','activation','qr','scan','add esim'],
+  transfer:     ['move','switch','reassign','new phone','new device','change device','migrate','migration'],
+  connection:   ['connect','connectivity','signal','network','no data','internet','roaming','apn'],
+  internet:     ['connection','data','connectivity','apn','network'],
+  slow:         ['speed','slow connection','connectivity'],
+  login:        ['sign in','log in','otp','password','access','verification','code'],
+  account:      ['login','profile','delete','unsubscribe'],
+  crash:        ['crash','bug','app','force close','not opening'],
+  esim:         ['sim','profile','qr code','qr','compatible','compatibility'],
+  data:         ['gb','gigabyte','plan','package','usage','extend','bundle'],
+  blocked:      ['fraud','ban','banned','suspended','disposable','email'],
+  fraud:        ['scam','suspicious','blocked','fake','disposable'],
+  referral:     ['refer','invite','friend','voucher','code','promo','gift','discount','coupon'],
+  voucher:      ['referral','promo','code','gift','discount','coupon','expired'],
+  roaming:      ['connection','apn','network','abroad','travel','international'],
+  sms:          ['otp','verification','code','text message'],
+  miles:        ['flying blue','afklm','air france','klm','points','loyalty','mileage'],
+  partner:      ['travel partner','airline','afklm','air france','flying blue'],
+};
+
 function sanitizeQuery(raw) {
   if (!raw) return '';
-  // Strip anything that isn't a letter, digit, space, hyphen, or apostrophe
   return raw.replace(/[^\w\s\-']/g, '').trim().toLowerCase();
+}
+
+function expandTerms(words, fullQuery) {
+  const expanded = new Set(words);
+  const conceptBoosts = new Set(); // concepts confirmed by a phrase match → extra scoring weight
+
+  // 1. Phrase-level scan — multi-word phrases carry the most intent signal
+  for (const [key, syns] of Object.entries(SYNONYMS)) {
+    const phraseHit = syns.some(phrase => phrase.includes(' ') && fullQuery.includes(phrase));
+    const keyHit    = fullQuery.includes(key);
+    if (phraseHit || keyHit) {
+      expanded.add(key);
+      syns.forEach(s => expanded.add(s));
+      if (phraseHit) conceptBoosts.add(key); // phrase match → will be heavily boosted in scoring
+    }
+  }
+
+  // 2. Word-level expansion for remaining tokens
+  for (const word of words) {
+    if (SYNONYMS[word]) {
+      SYNONYMS[word].forEach(s => expanded.add(s));
+    }
+    for (const [key, syns] of Object.entries(SYNONYMS)) {
+      if (syns.some(s => s === word)) {
+        expanded.add(key);
+        syns.forEach(s => expanded.add(s));
+      }
+    }
+  }
+
+  return { terms: Array.from(expanded), boostConcepts: Array.from(conceptBoosts) };
+}
+
+function scoreText(text, terms, phrase) {
+  let score = 0;
+  if (phrase && text.includes(phrase)) score += 50;
+  for (const term of terms) {
+    if (text.includes(term)) score += term.includes(' ') ? 30 : 15; // phrases score more
+  }
+  return score;
 }
 
 function searchArticles(articles, rawQuery) {
   const q = sanitizeQuery(rawQuery);
   if (!q) return [];
 
-  const words = q.split(/\s+/).filter(w => w.length > 1);
+  // Split, remove stopwords, keep known short terms (gb, eu, uk, qr)
+  const KEEP_SHORT = new Set(['gb','eu','uk','qr','us','fr']);
+  const rawWords = q.split(/\s+/).filter(w =>
+    (w.length > 2 || KEEP_SHORT.has(w)) && !STOPWORDS.has(w)
+  );
+  if (rawWords.length === 0) return [];
+
+  const { terms: expanded, boostConcepts } = expandTerms(rawWords, q);
 
   const scored = articles.map(article => {
-    const titleLower = article.title.toLowerCase();
-    const categoryLower = article.category.toLowerCase();
-    const keywordsLower = article.keywords;
-    const contentLower = article.content || '';
+    const title    = article.title.toLowerCase();
+    const category = article.category.toLowerCase();
+    const keywords = article.keywords;
+    const content  = article.content || '';
     let score = 0;
 
-    // Exact title match
-    if (titleLower === q) score += 300;
-    else if (titleLower.includes(q)) score += 150;
+    // Exact / phrase match on full query
+    if (title === q)            score += 400;
+    else if (title.includes(q)) score += 200;
+    if (category.includes(q))   score += 80;
+    if (keywords.includes(q))   score += 60;
+    if (content.includes(q))    score += 50;
 
-    // Category match
-    if (categoryLower.includes(q)) score += 60;
+    // Expanded term scoring across all fields
+    score += scoreText(title,    expanded, q) * 2;  // title weighted 2x
+    score += scoreText(category, expanded, q);
+    score += scoreText(keywords, expanded, q);
+    score += scoreText(content,  expanded, q);
 
-    // Keyword field match
-    if (keywordsLower.includes(q)) score += 50;
+    // Concept boost: phrase match confirmed the intent → heavily reward title hits
+    for (const concept of boostConcepts) {
+      if (title.includes(concept))    score += 200;
+      if (category.includes(concept)) score += 80;
+      if (keywords.includes(concept)) score += 60;
+    }
 
-    // Full content match
-    if (contentLower.includes(q)) score += 40;
-
-    // Per-word scoring
-    for (const word of words) {
-      if (titleLower.includes(word)) score += 40;
-      if (categoryLower.includes(word)) score += 20;
-      if (keywordsLower.includes(word)) score += 15;
-      if (contentLower.includes(word)) score += 10;
-
-      // Prefix match: "refund" matches "refunds"
-      const titleWords = titleLower.split(/[\s:,\-&]+/);
-      for (const tw of titleWords) {
-        if (tw.startsWith(word) || word.startsWith(tw)) score += 20;
+    // Prefix match on individual title words
+    const titleTokens = title.split(/[\s:,\-&()]+/);
+    for (const word of rawWords) {
+      for (const token of titleTokens) {
+        if (token && (token.startsWith(word) || word.startsWith(token))) score += 15;
       }
     }
 
