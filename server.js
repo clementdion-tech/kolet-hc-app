@@ -350,23 +350,161 @@ function extractContactContext(body) {
   };
 }
 
-// Returns a specific hint string when contact data maps to a known installation sub-case
-function getInstallationHint(ctx) {
+// Returns the single most relevant agent hint for this article + contact context combination
+function getArticleHint(article, ctx) {
   if (!ctx) return null;
-  const esimInstalled = /installed|enabled|active/.test(ctx.esimStatus);
 
-  if (ctx.esimCompatible === false)
-    return 'Check 3.2 — device not compatible';
-  if (ctx.isChineseDevice)
-    return `Check 3.6 — ${ctx.deviceBrand} device (China/HK/Macao)`;
-  if (ctx.esimInstallCount >= 3 && ctx.isOneClick === false)
-    return 'Check 3.0 — 1-click install limit reached (3×)';
-  if (ctx.esimInstallCount > 1)
-    return 'Check 3.7 — eSIM previously installed on another device';
-  if (esimInstalled && ctx.dataNeverUsed && ctx.esimLastCountry === null)
-    return 'Check 3.9 — eSIM installed but not yet active';
-  if (!ctx.esimIccid && !esimInstalled)
-    return 'Check 3.10 — no eSIM linked to account';
+  const title    = article.title.toLowerCase();
+  const category = article.category.toLowerCase();
+
+  const esimInstalled   = /installed|enabled|active/.test(ctx.esimStatus);
+  const esimUninstalled = /uninstalled|not_installed|deleted/.test(ctx.esimStatus);
+  const esimDisabled    = /disabled/.test(ctx.esimStatus);
+  const neverConnected  = esimInstalled && ctx.esimLastCountry === null;
+
+  // ── Installation ──────────────────────────────────────────────────────────
+  if (category.includes('install') || title.includes('install') || title.includes('qr') ||
+      title.includes('setup') || title.includes('set up') || title.includes('activate') ||
+      title.includes('add esim')) {
+    if (ctx.esimCompatible === false)
+      return 'Check 3.2 — device not compatible';
+    if (ctx.isChineseDevice)
+      return `Check 3.6 — ${ctx.deviceBrand} device (China/HK/Macao)`;
+    if (ctx.esimInstallCount >= 3 && ctx.isOneClick === false)
+      return 'Check 3.0 — 1-click install limit reached (3×)';
+    if (ctx.esimInstallCount > 1)
+      return 'Check 3.7 — eSIM previously installed on another device';
+    if (esimInstalled && ctx.dataNeverUsed && neverConnected)
+      return 'Check 3.9 — eSIM installed but not yet active';
+    if (!ctx.esimIccid && !esimInstalled)
+      return 'Check 3.10 — no eSIM linked to account';
+    if (esimInstalled)
+      return `eSIM status: ${ctx.esimStatus}`;
+    if (esimUninstalled)
+      return 'eSIM uninstalled — fresh install expected';
+  }
+
+  // ── Connection / start using / APN ────────────────────────────────────────
+  if (category.includes('connect') || category.includes('start using') ||
+      title.includes('apn') || title.includes('connect') || title.includes('no data') ||
+      title.includes('internet') || title.includes('roaming') || title.includes('signal')) {
+    if (ctx.isRestrictedCountry)
+      return `Destination: ${ctx.planZone.toUpperCase()} — government restrictions may apply`;
+    if (ctx.dataNeverUsed && esimInstalled)
+      return 'eSIM installed — data never used, check APN';
+    if (neverConnected)
+      return 'eSIM installed but never detected by network';
+    if (ctx.dataExpired)
+      return 'Data plan expired — renewal needed before reconnecting';
+    if (esimDisabled)
+      return `eSIM disabled (status: ${ctx.esimStatus})`;
+    if (ctx.planZoneLabel)
+      return `Current destination zone: ${ctx.planZoneLabel}`;
+    if (ctx.isAndroid)
+      return 'Android device — APN may need manual setup';
+  }
+
+  // ── Refund / billing / invoice ────────────────────────────────────────────
+  if (category.includes('refund') || category.includes('billing') ||
+      title.includes('refund') || title.includes('reimburse') ||
+      title.includes('invoice') || title.includes('payment') || title.includes('cashback')) {
+    if (ctx.dataNeverUsed && esimInstalled)
+      return 'Data never used — full refund likely applicable';
+    if (ctx.dataNeverUsed)
+      return 'Data never used';
+    if (ctx.dataExpired)
+      return 'Plan expired — check refund eligibility';
+    if (ctx.isNewUser)
+      return 'First-time customer';
+  }
+
+  // ── Account / login / verification ───────────────────────────────────────
+  if (category.includes('account') || category.includes('login') ||
+      title.includes('login') || title.includes('sign in') || title.includes('otp') ||
+      title.includes('password') || title.includes('delete account')) {
+    if (ctx.fraudSuspected)
+      return '⚠️ Fraud flag active on this account';
+    if (ctx.isB2B)
+      return 'B2B account';
+    if (ctx.isNewUser)
+      return 'New / first-time account';
+  }
+
+  // ── Fraud / blocked / banned ──────────────────────────────────────────────
+  if (category.includes('fraud') || title.includes('fraud') ||
+      title.includes('ban') || title.includes('suspended') || title.includes('disposable')) {
+    if (ctx.fraudSuspected)
+      return '⚠️ Fraud flag is active on this account';
+    if (ctx.isB2B)
+      return 'B2B account';
+  }
+
+  // ── Transfer / reassign / new device ─────────────────────────────────────
+  if (title.includes('reassign') || title.includes('transfer') || title.includes('move') ||
+      title.includes('new device') || title.includes('new phone') || title.includes('change device') ||
+      title.includes('migrate') || category.includes('transfer')) {
+    if (ctx.esimInstallCount > 1)
+      return `eSIM installed ${ctx.esimInstallCount}× — previously used on another device`;
+    if (ctx.esimInstallCount === 1)
+      return 'eSIM installed once — on current device';
+    if (ctx.isChineseDevice)
+      return `${ctx.deviceBrand} — verify eSIM slot availability on new device`;
+  }
+
+  // ── Data plan / extend / renew ────────────────────────────────────────────
+  if (category.includes('data') || category.includes('plan') ||
+      title.includes('extend') || title.includes('renew') || title.includes('top up') ||
+      title.includes(' gb') || title.includes('bundle') || title.includes('usage')) {
+    if (ctx.dataExpired)
+      return 'Current plan expired — renewal needed';
+    if (ctx.dataNeverUsed)
+      return 'Current plan active but never used';
+    if (ctx.planZoneLabel)
+      return `Active zone: ${ctx.planZoneLabel}`;
+  }
+
+  // ── Restricted country / government block ────────────────────────────────
+  if (title.includes('egyptian') || title.includes('turkish') || title.includes('china') ||
+      title.includes('government') || title.includes('constraint') || title.includes('vpn')) {
+    if (ctx.isRestrictedCountry)
+      return `Customer destination: ${ctx.planZone.toUpperCase()} — matches this restriction`;
+    if (ctx.planZone)
+      return `Customer zone: ${ctx.planZone.toUpperCase()}`;
+  }
+
+  // ── Partner articles ──────────────────────────────────────────────────────
+  if (category.includes('travel partner') || category.includes('partner') ||
+      title.includes('partner')) {
+    if (ctx.partnerSlug && ctx.partnerSlug !== 'user_soft_launch' && ctx.partnerSlug !== '')
+      return `Acquired via: ${ctx.partnerSlug.replace(/_/g, ' ')}`;
+  }
+
+  // ── Flying Blue / miles / loyalty ─────────────────────────────────────────
+  if (title.includes('flying blue') || title.includes('air france') ||
+      title.includes('miles') || title.includes('afklm') || title.includes('loyalty') ||
+      category.includes('miles')) {
+    if (ctx.hasFlyingBlue)
+      return 'Flying Blue member — loyalty account is linked';
+    if (ctx.partnerSlug && ctx.partnerSlug.includes('afklm'))
+      return 'AF/KLM partner acquisition';
+  }
+
+  // ── Referral / voucher / promo ────────────────────────────────────────────
+  if (title.includes('referral') || title.includes('voucher') || title.includes('promo') ||
+      title.includes('discount') || title.includes('invite') || category.includes('referral')) {
+    if (ctx.hasReferred)
+      return 'Customer has already referred friends';
+    if (ctx.isNewUser)
+      return 'New user — may have redeemed a referral';
+  }
+
+  // ── B2B ───────────────────────────────────────────────────────────────────
+  if (title.includes('b2b') || title.includes('business') || title.includes('enterprise') ||
+      category.includes('b2b')) {
+    if (ctx.isB2B)
+      return 'B2B account confirmed';
+  }
+
   return null;
 }
 
@@ -547,10 +685,9 @@ function buildSuggestionsCanvas(articles, convQuery, ctx) {
     { type: "text", text: "Suggested articles", style: "header" },
   ];
 
-  const installHint = ctx ? getInstallationHint(ctx) : null;
-
   for (let i = 0; i < articles.length; i++) {
     const article = articles[i];
+    const hint = getArticleHint(article, ctx);
     components.push({ type: "divider" });
     if (article.category) {
       components.push({ type: "text", text: article.category, style: "muted" });
@@ -562,8 +699,8 @@ function buildSuggestionsCanvas(articles, convQuery, ctx) {
       style: "link",
       action: { type: "url", url: article.url }
     });
-    if (installHint && article.category.toLowerCase().includes('install')) {
-      components.push({ type: "text", text: `⚡ ${installHint}`, style: "muted" });
+    if (hint) {
+      components.push({ type: "text", text: `⚡ ${hint}`, style: "muted" });
     }
   }
 
@@ -595,13 +732,12 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx) {
     { type: "text", text: headerText, style: "header" },
   ];
 
-  const installHint = ctx ? getInstallationHint(ctx) : null;
-
   if (articles.length === 0) {
     components.push({ type: "text", text: "No articles found.", style: "muted" });
   } else {
     for (let i = 0; i < articles.length; i++) {
       const article = articles[i];
+      const hint = getArticleHint(article, ctx);
       components.push({ type: "divider" });
       if (article.category) {
         components.push({ type: "text", text: article.category, style: "muted" });
@@ -613,8 +749,8 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx) {
         style: "link",
         action: { type: "url", url: article.url }
       });
-      if (installHint && article.category.toLowerCase().includes('install')) {
-        components.push({ type: "text", text: `⚡ ${installHint}`, style: "muted" });
+      if (hint) {
+        components.push({ type: "text", text: `⚡ ${hint}`, style: "muted" });
       }
     }
   }
