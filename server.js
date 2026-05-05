@@ -95,7 +95,7 @@ const searchUI = {
   canvas: {
     content: {
       components: [
-        { type: "text", text: "🧠 KokoBrain Search", style: "header" },
+        { type: "text", text: "KokoBrain Search", style: "header" },
         { type: "text", text: "Search the internal knowledge base", style: "muted" },
         { type: "spacer", size: "s" },
         {
@@ -119,7 +119,7 @@ const searchUI = {
 
 function buildResultsCanvas(query, articles) {
   const components = [
-    { type: "text", text: `🧠 Results for "${query}"`, style: "header" },
+    { type: "text", text: `Results for "${query}"`, style: "header" },
     { type: "divider" }
   ];
 
@@ -134,11 +134,11 @@ function buildResultsCanvas(query, articles) {
       if (article.category) {
         components.push({ type: "text", text: article.category, style: "muted" });
       }
-      components.push({ type: "text", text: `📄 ${article.title}`, style: "paragraph" });
+      components.push({ type: "text", text: article.title, style: "muted" });
       components.push({
         type: "button",
-        label: "Open in Notion →",
-        style: "link",
+        label: "Open in Notion",
+        style: "secondary",
         action: { type: "url", url: article.url }
       });
       components.push({ type: "spacer", size: "s" });
