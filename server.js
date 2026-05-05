@@ -333,37 +333,94 @@ const SYNONYMS = {
 
 // Regex-based intent detection — more robust than keyword expansion for short/noisy text.
 // Works across languages by matching common patterns rather than specific words.
+// Covers every IKC article category so no conversation type falls through.
 function detectIntents(text) {
   const q = (text || '').toLowerCase();
   const intents = new Set();
 
-  // Locate eSIM in settings
+  // ── Locate eSIM in settings ───────────────────────────────────────────────
   if (/can.{0,5}(see|find|locat|spot)\b|not?.{0,5}(show|visible|appear|find)\b|ne (trouve|vois) pas|non (trovo|vedo)|no (encuentr|veo)\b|(see|find|locat).{0,20}esim|esim.{0,20}(not|ne|no).{0,15}(show|find|see|visible|appear)|where.{0,15}(is.{0,5})?(my.{0,5})?esim/.test(q))
     intents.add('locate');
 
-  // Connectivity / no data / no internet
+  // ── Connectivity / no data / SOS ─────────────────────────────────────────
   if (/(no|without|pas de|keine|sin|senza).{0,15}(internet|data|connection|service|signal|connexion|datos|verbindung)|not.{0,10}(connect|work|get data|receiv)|sos only|greyed.{0,8}out|toggle.{0,8}(grey|gray)|wifi.{0,8}off|no connection/.test(q))
     intents.add('connection');
 
-  // Installation
-  if (/\binstall|\bsetup|\bset up|qr.{0,5}(scan|code)|scan.{0,5}qr|add.{0,5}esim|can.{0,5}t install/.test(q))
+  // ── Slow / throttled connection ───────────────────────────────────────────
+  if (/slow|speed.{0,10}(low|bad|poor)|throttl|limited.{0,8}speed|very.{0,5}slow|lent|langsa|lento|lentas/.test(q))
+    intents.add('slow');
+
+  // ── Installation ──────────────────────────────────────────────────────────
+  if (/\binstall|\bsetup|\bset up|qr.{0,5}(scan|code)|scan.{0,5}qr|add.{0,5}esim|can.{0,5}t install|activation.{0,10}(mode|stuck)|stuck.{0,10}activat/.test(q))
     intents.add('install');
 
-  // Refund / money
-  if (/refund|reimburse|cashback|money back|rembours|reembolso|rimborso|want.{0,10}money/.test(q))
+  // ── Extend / top up data plan ─────────────────────────────────────────────
+  if (/\bextend\b|\brenew\b|top.{0,3}up|add.{0,8}(data|gb)|more.{0,5}(data|gb)|refill|recharge|buy.{0,8}(plan|data|gb)|purchase.{0,8}(plan|data)|renouveler|aufladen/.test(q))
+    intents.add('extend');
+
+  // ── Data expired / ran out ────────────────────────────────────────────────
+  if (/expir|ran.{0,5}out|no.{0,5}more.{0,5}data|used.{0,5}up|data.{0,5}(finish|end|gone|over)|plan.{0,5}(end|finish|over)|expiré|caducado/.test(q))
+    intents.add('expired');
+
+  // ── Refund / money back ───────────────────────────────────────────────────
+  if (/refund|reimburse|cashback|money.{0,5}back|rembours|reembolso|rimborso|want.{0,10}money|get.{0,10}money/.test(q))
     intents.add('refund');
 
-  // Transfer / new device
-  if (/(new|broken|defect|replac).{0,15}(phone|device)|reassign|factory.{0,5}reset|transfer.{0,8}esim/.test(q))
+  // ── Invoice / receipt / billing ───────────────────────────────────────────
+  if (/invoice|receipt|billing|facture|factura|fattura|rechnung|need.{0,10}(bill|receipt)|justif/.test(q))
+    intents.add('invoice');
+
+  // ── Transfer eSIM / new device ────────────────────────────────────────────
+  if (/(new|broken|defect|replac|lost|stolen).{0,15}(phone|device)|reassign|factory.{0,5}reset|transfer.{0,8}esim|move.{0,8}esim|changer.{0,8}téléphone/.test(q))
     intents.add('transfer');
 
-  // Login / account
-  if (/\blog.{0,4}in\b|\bsign.{0,4}in\b|\botp\b|\bpassword\b|can.{0,5}t.{0,10}(access|log|sign)|delete.{0,8}account/.test(q))
+  // ── Account / login / OTP ─────────────────────────────────────────────────
+  if (/\blog.{0,4}in\b|\bsign.{0,4}in\b|\botp\b|\bpassword\b|can.{0,5}t.{0,10}(access|log|sign)|verification.{0,8}code|code.{0,8}(not|never).{0,8}(receiv|arriv|sent)/.test(q))
     intents.add('account');
 
-  // VoIP / calls
-  if (/\bvoip\b|\bcall\b|\bappel|\bappels\b|phone.{0,8}(call|number)|international.{0,8}call/.test(q))
+  // ── Delete account / unsubscribe ──────────────────────────────────────────
+  if (/delete.{0,8}account|close.{0,8}account|remove.{0,8}account|unsubscribe|cancel.{0,8}account|supprimer.{0,8}compte|eliminar.{0,8}cuenta/.test(q))
+    intents.add('delete_account');
+
+  // ── Change email address ──────────────────────────────────────────────────
+  if (/change.{0,8}email|new.{0,8}email|update.{0,8}email|wrong.{0,8}email|changer.{0,8}(email|mail)|modifier.{0,8}(email|mail)/.test(q))
+    intents.add('change_email');
+
+  // ── Koins / wallet / convert unused data ─────────────────────────────────
+  if (/\bkoin|\bwallet\b|convert.{0,10}(data|unused)|unused.{0,8}data|remaining.{0,8}(data|credit)|crédit.{0,8}restant|in.?app.{0,8}credit/.test(q))
+    intents.add('koins');
+
+  // ── Voucher / promo / referral ────────────────────────────────────────────
+  if (/voucher|promo.{0,5}code|referral|discount|coupon|code.{0,8}(not|doesn.{0,3}t).{0,8}(work|valid)|code.{0,8}invalid|when.{0,15}(start|begin|valid)|validit/.test(q))
+    intents.add('voucher');
+
+  // ── Gift / data donation ──────────────────────────────────────────────────
+  if (/\bgift\b|donat.{0,8}data|share.{0,8}data|send.{0,8}data|data.{0,8}(to|for).{0,8}(friend|family)|cadeau|regalo/.test(q))
+    intents.add('gift');
+
+  // ── Compatibility / adapter ───────────────────────────────────────────────
+  if (/\badapter\b|not.{0,8}compatible|incompatible|device.{0,8}(not|doesn.{0,3}t).{0,8}support|support.{0,8}esim|esim.{0,8}support/.test(q))
+    intents.add('compatibility');
+
+  // ── VoIP / in-app calls ───────────────────────────────────────────────────
+  if (/\bvoip\b|\bcall\b|\bappel|\bappels\b|phone.{0,8}(call|number)|international.{0,8}call|make.{0,8}call|microphone|micro\b/.test(q))
     intents.add('voip');
+
+  // ── Flying Blue / miles / loyalty ────────────────────────────────────────
+  if (/flying.{0,5}blue|air.{0,5}france|afklm|\bklm\b|\bmiles\b|\bpoints\b|loyalty|mileage/.test(q))
+    intents.add('miles');
+
+  // ── Fraud / blocked account ───────────────────────────────────────────────
+  if (/\bfraud\b|\bban(ned)?\b|\bsuspend|blocked.{0,8}account|disposable.{0,8}email|account.{0,8}(ban|block|suspend)/.test(q))
+    intents.add('fraud');
+
+  // ── Government / IMEI restrictions ───────────────────────────────────────
+  if (/\bimei\b|government.{0,8}(block|restrict)|egypt|turkey|turkish|egyptian|register.{0,8}(phone|device)/.test(q))
+    intents.add('government');
+
+  // ── SMS / verification / messaging ───────────────────────────────────────
+  if (/\bsms\b|\bmms\b|text.{0,5}message|whatsapp|imessage|send.{0,8}(sms|text|message)|receiv.{0,8}(sms|text|message)|phone.{0,8}number/.test(q))
+    intents.add('sms');
 
   return intents;
 }
@@ -815,61 +872,125 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
   const signalText = [convCtx?.text || '', inboxName, tagText].join(' ');
   const intents = detectIntents(signalText);
 
-  // Intercom workflow tags are very high-confidence intent signals
-  if (/locat|find.{0,10}esim|request.*locat/i.test(tagText))  intents.add('locate');
-  if (/connect|start.?using|no.?internet|no.?data/i.test(tagText)) intents.add('connection');
-  if (/install|setup|qr/i.test(tagText))   intents.add('install');
-  if (/refund|billing|payment/i.test(tagText)) intents.add('refund');
-  if (/voip|call/i.test(tagText))          intents.add('voip');
-  if (/transfer|reassign|new.?device/i.test(tagText)) intents.add('transfer');
-
-  // Inbox / team name intent signals
-  if (/start.?using|locat|connect/i.test(inboxName)) {
-    intents.add('locate');
-    intents.add('connection');
-  }
-  if (/install/i.test(inboxName))  intents.add('install');
-  if (/refund|billing/i.test(inboxName)) intents.add('refund');
-  if (/voip|call/i.test(inboxName)) intents.add('voip');
+  // Intercom workflow tags are very high-confidence intent signals — map all known tag patterns
+  const TAG_INTENT_MAP = [
+    [/locat|find.{0,10}esim|request.*locat/i,        'locate'],
+    [/connect|start.?using|no.?internet|no.?data|few.?kb/i, 'connection'],
+    [/slow|throttl/i,                                 'slow'],
+    [/install|setup|qr/i,                             'install'],
+    [/extend|renew|top.?up|more.?data/i,              'extend'],
+    [/expir|ran.?out|no.?more.?data/i,                'expired'],
+    [/refund|cashback|reimburs/i,                     'refund'],
+    [/invoice|receipt|billing|payment/i,              'invoice'],
+    [/transfer|reassign|new.?device/i,                'transfer'],
+    [/login|sign.?in|otp|password|access/i,           'account'],
+    [/delete.?account|unsubscribe/i,                  'delete_account'],
+    [/change.?email|email.?address/i,                 'change_email'],
+    [/koin|wallet|convert|unused.?data/i,             'koins'],
+    [/voucher|promo|referral|discount/i,              'voucher'],
+    [/gift|donat|share.?data/i,                       'gift'],
+    [/adapter|compat/i,                               'compatibility'],
+    [/voip|call/i,                                    'voip'],
+    [/flying.?blue|miles|afklm|air.?france/i,         'miles'],
+    [/fraud|ban|suspend|block/i,                      'fraud'],
+    [/imei|egypt|turkey|government/i,                 'government'],
+    [/sms|verification|otp.?not|code.?not/i,          'sms'],
+  ];
+  TAG_INTENT_MAP.forEach(([re, intent]) => {
+    if (re.test(tagText) || re.test(inboxName)) intents.add(intent);
+  });
 
   // ── Step 3: inject articles for each detected intent ─────────────────────
-  if (intents.has('locate')) {
-    inject(allArticles, a => {
+  const INTENT_INJECT_MAP = [
+    ['locate',        a => {
       const t = a.title.toLowerCase();
-      return t.includes('find') || t.includes('locat') || t.includes('cannot find') ||
-             t.includes('see my') || t.includes('cannot see');
-    }, 320);
-  }
-  if (intents.has('connection')) {
-    inject(allArticles, a => {
+      return t.includes('find') || t.includes('locat') || t.includes('cannot find') || t.includes('cannot see');
+    }, 320],
+    ['connection',    a => {
       const cat = a.category.toLowerCase();
       const t   = a.title.toLowerCase();
       return cat.includes('connect') || cat.includes('start using') ||
              t.includes('apn') || t.includes('no data') || t.includes('no internet');
-    }, 300);
-  }
-  if (intents.has('install')) {
-    inject(allArticles, a => a.category.toLowerCase().includes('install'), 290);
-  }
-  if (intents.has('refund')) {
-    inject(allArticles, a => {
+    }, 300],
+    ['slow',          a => a.title.toLowerCase().includes('slow'), 300],
+    ['install',       a => a.category.toLowerCase().includes('install'), 290],
+    ['extend',        a => {
+      const t = a.title.toLowerCase();
+      return t.includes('extend') || t.includes('renew') || t.includes('top up') || t.includes('topup');
+    }, 290],
+    ['expired',       a => {
+      const t = a.title.toLowerCase();
+      return t.includes('extend') || t.includes('renew') || t.includes('expir');
+    }, 290],
+    ['refund',        a => {
       const cat = a.category.toLowerCase();
       const t   = a.title.toLowerCase();
       return cat.includes('refund') || cat.includes('billing') ||
-             t.includes('refund') || t.includes('reimburse');
-    }, 290);
-  }
-  if (intents.has('voip')) {
-    inject(allArticles, a => {
+             t.includes('refund') || t.includes('reimburse') || t.includes('cashback');
+    }, 290],
+    ['invoice',       a => {
+      const t = a.title.toLowerCase();
+      return t.includes('invoice') || t.includes('receipt') || t.includes('billing');
+    }, 290],
+    ['transfer',      a => {
+      const t = a.title.toLowerCase();
+      return t.includes('reassign') || t.includes('transfer') || t.includes('move') || t.includes('new device');
+    }, 290],
+    ['account',       a => {
+      const cat = a.category.toLowerCase();
+      const t   = a.title.toLowerCase();
+      return cat.includes('account') || cat.includes('login') ||
+             t.includes('login') || t.includes('otp') || t.includes('password');
+    }, 290],
+    ['delete_account', a => {
+      const t = a.title.toLowerCase();
+      return t.includes('delete') || t.includes('unsubscribe');
+    }, 290],
+    ['change_email',   a => {
+      const t = a.title.toLowerCase();
+      return t.includes('email') || t.includes('transferring account');
+    }, 280],
+    ['koins',         a => {
+      const t = a.title.toLowerCase();
+      return t.includes('koin') || t.includes('wallet') || t.includes('convert') || t.includes('unused');
+    }, 290],
+    ['voucher',       a => {
+      const t = a.title.toLowerCase();
+      return t.includes('voucher') || t.includes('promo') || t.includes('referral') || t.includes('discount');
+    }, 290],
+    ['gift',          a => {
+      const t = a.title.toLowerCase();
+      return t.includes('gift') || t.includes('donat') || t.includes('share data');
+    }, 290],
+    ['compatibility', a => {
+      const t = a.title.toLowerCase();
+      return t.includes('adapter') || t.includes('compatible') || t.includes('compatibility');
+    }, 280],
+    ['voip',          a => {
       const t = a.title.toLowerCase();
       return t.includes('voip') || t.includes('calling') || t.includes('call');
-    }, 310);
-  }
-  if (intents.has('transfer')) {
-    inject(allArticles, a => {
+    }, 310],
+    ['miles',         a => {
       const t = a.title.toLowerCase();
-      return t.includes('reassign') || t.includes('transfer') || t.includes('new device');
-    }, 290);
+      return t.includes('flying blue') || t.includes('air france') || t.includes('afklm') || t.includes('miles');
+    }, 290],
+    ['fraud',         a => {
+      const cat = a.category.toLowerCase();
+      return cat.includes('fraud') || a.title.toLowerCase().includes('fraud');
+    }, 290],
+    ['government',    a => {
+      const t = a.title.toLowerCase();
+      return t.includes('egyptian') || t.includes('turkish') || t.includes('government') ||
+             t.includes('imei') || t.includes('constraint');
+    }, 290],
+    ['sms',           a => {
+      const t = a.title.toLowerCase();
+      return t.includes('sms') || t.includes('otp') || (t.includes('phone') && t.includes('number'));
+    }, 280],
+  ];
+
+  for (const [intent, filterFn, score] of INTENT_INJECT_MAP) {
+    if (intents.has(intent)) inject(allArticles, filterFn, score);
   }
 
   const combined = [...scored, ...injected];
@@ -1124,7 +1245,8 @@ function buildSuggestionsCanvas(articles, convCtx, ctx) {
       stored_data: {
         conv_query: convCtx ? buildConvSearchQuery(convCtx).slice(0, 400) : '',
         ctx: ctx || null,
-        suggestion_urls: articles.map(a => a.url),
+        // Store display fields directly — back button uses these, no URL lookup needed
+        suggestion_articles: articles.map(a => ({ title: a.title, url: a.url, category: a.category })),
       },
       content: { components }
     }
@@ -1144,7 +1266,7 @@ const searchOnlyCanvas = {
   }
 };
 
-function buildResultsCanvas(headerText, articles, convQuery, ctx, suggestionUrls = []) {
+function buildResultsCanvas(headerText, articles, convQuery, ctx, suggestionArticles = []) {
   const backButton = {
     type: "button",
     id: "back_btn",
@@ -1185,7 +1307,7 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx, suggestionUrls
 
   return {
     canvas: {
-      stored_data: { conv_query: convQuery || '', ctx: ctx || null, suggestion_urls: suggestionUrls },
+      stored_data: { conv_query: convQuery || '', ctx: ctx || null, suggestion_articles: suggestionArticles },
       content: { components }
     }
   };
@@ -1245,26 +1367,22 @@ app.post('/intercom/submit', async (req, res) => {
     lastSubmit = req.body;
     console.log('SUBMIT component_id:', req.body.component_id);
 
-    const componentId    = req.body.component_id || '';
-    const storedData     = req.body.canvas_data?.stored_data || {};
+    const componentId      = req.body.component_id || '';
+    const storedData       = req.body.canvas_data?.stored_data || {};
     const storedConvQuery  = storedData.conv_query || '';
     const storedCtx        = storedData.ctx || null;
-    const storedSuggUrls   = storedData.suggestion_urls || [];
+    const storedSuggArticles = storedData.suggestion_articles || [];
 
     // URL buttons open Notion directly — no state change needed
     if (componentId.startsWith('open_')) {
       return res.status(200).end();
     }
 
-    // Back to suggestions (or clear results if no suggestions were shown)
+    // Back to suggestions — uses stored article data, no DB lookup needed
     if (componentId === 'back_btn') {
-      if (storedSuggUrls.length > 0) {
-        const allArticles = await getArticles();
-        const suggestions = storedSuggUrls
-          .map(url => allArticles.find(a => a.url === url))
-          .filter(Boolean);
+      if (storedSuggArticles.length > 0) {
         const backConvCtx = { text: storedConvQuery, inboxName: '', tags: [], topic: '' };
-        return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx));
+        return res.json(buildSuggestionsCanvas(storedSuggArticles, backConvCtx, storedCtx));
       }
       return res.json(searchOnlyCanvas);
     }
@@ -1279,7 +1397,7 @@ app.post('/intercom/submit', async (req, res) => {
     const rawResults = searchArticles(articles, query);
     const results    = applyContextBoosts(articles, rawResults, storedCtx);
     console.log(`Found ${results.length} for "${query}"`);
-    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery || null, storedCtx, storedSuggUrls));
+    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery || null, storedCtx, storedSuggArticles));
 
   } catch (err) {
     lastError = { route: 'submit', message: err.message, stack: err.stack, time: new Date().toISOString() };
