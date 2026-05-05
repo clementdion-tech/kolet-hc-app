@@ -132,7 +132,7 @@ const DOMAIN_TERMS = new Set([
   'promo','miles','loyalty','partner','otp','verification','password',
   'login','account','billing','payment','credit','balance','topup','adapter',
   'android','iphone','pixel','samsung','huawei','xiaomi','oppo',
-  'restricted','blocked','government','vpn','zone','country','egypt','turkey',
+  'restricted','blocked','government','vpn','zone','country','constraint','constraints','egypt','turkey',
   'china','flying','blue','afklm','airfrance','klm','oneclick','qrcode',
   'reimbursement','cashback','uninstall','reinstall','reactivate','disable',
   'enabled','disabled','installed','detected','coverage','bandwidth','speed',
@@ -245,7 +245,9 @@ const SYNONYMS = {
   connection:   ['connect','connectivity','signal','network','no data','internet','roaming','apn',
                  'not connecting','not working','no service','no internet','not getting service',
                  'sos','sos only','greyed','greyed out','grayed','grayed out','grey toggle',
-                 'gray toggle','toggle grey','toggle gray','esim greyed','toggle disabled'],
+                 'gray toggle','toggle grey','toggle gray','esim greyed','toggle disabled',
+                 'country constraint','specific country','country issue','country problem',
+                 'works in some countries','not working in','restricted in','blocked in'],
   internet:     ['connection','data','connectivity','apn','network'],
   slow:         ['speed','slow connection','connectivity','throttle','throttled'],
   roaming:      ['connection','apn','network','abroad','travel','international',
@@ -910,9 +912,13 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
       const cat = a.category.toLowerCase();
       const t   = a.title.toLowerCase();
       return cat.includes('connect') || cat.includes('start using') ||
-             t.includes('apn') || t.includes('no data') || t.includes('no internet');
+             t.includes('apn') || t.includes('no data') || t.includes('no internet') ||
+             t.includes('constraint') || t.includes('country');
     }, 300],
-    ['slow',          a => a.title.toLowerCase().includes('slow'), 300],
+    ['slow',          a => {
+      const t = a.title.toLowerCase();
+      return t.includes('slow') || t.includes('constraint') || t.includes('country');
+    }, 300],
     ['install',       a => a.category.toLowerCase().includes('install'), 290],
     ['extend',        a => {
       const t = a.title.toLowerCase();
@@ -981,8 +987,8 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
     ['government',    a => {
       const t = a.title.toLowerCase();
       return t.includes('egyptian') || t.includes('turkish') || t.includes('government') ||
-             t.includes('imei') || t.includes('constraint');
-    }, 290],
+             t.includes('imei') || t.includes('constraint') || t.includes('country');
+    }, 300],
     ['sms',           a => {
       const t = a.title.toLowerCase();
       return t.includes('sms') || t.includes('otp') || (t.includes('phone') && t.includes('number'));
@@ -1002,7 +1008,7 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
         const cat = a.category.toLowerCase();
         const t   = a.title.toLowerCase();
         return cat.includes('connect') || cat.includes('start using') ||
-               t.includes('find') || t.includes('locat');
+               t.includes('find') || t.includes('locat') || t.includes('constraint');
       }, 120);
     } else if (esimUninstalled || !ctx.esimIccid) {
       inject(allArticles, a => a.category.toLowerCase().includes('install'), 120);
