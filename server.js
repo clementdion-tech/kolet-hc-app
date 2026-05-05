@@ -135,7 +135,12 @@ function buildResultsCanvas(query, articles) {
         components.push({ type: "text", text: article.category, style: "muted" });
       }
       components.push({ type: "text", text: `📄 ${article.title}`, style: "paragraph" });
-      components.push({ type: "anchor", href: article.url, text: "Open in Notion →" });
+      components.push({
+        type: "button",
+        label: "Open in Notion →",
+        style: "link",
+        action: { type: "url", url: article.url }
+      });
       components.push({ type: "spacer", size: "s" });
     }
   }
