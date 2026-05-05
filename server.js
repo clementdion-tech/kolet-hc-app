@@ -968,8 +968,17 @@ const searchOnlyCanvas = {
 };
 
 function buildResultsCanvas(headerText, articles, convQuery, ctx) {
+  const backButton = {
+    type: "button",
+    id: "back_btn",
+    label: convQuery ? "← Back to suggestions" : "← Clear results",
+    style: "secondary",
+    action: { type: "submit" }
+  };
+
   const components = [
     ...searchInputComponents(),
+    backButton,
     { type: "divider" },
     { type: "text", text: headerText, style: "header" },
   ];
@@ -995,18 +1004,6 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx) {
         components.push({ type: "text", text: `⚡ ${hint}`, style: "muted" });
       }
     }
-  }
-
-  // Back to suggestions only if there was a conversation context
-  if (convQuery) {
-    components.push({ type: "divider" });
-    components.push({
-      type: "button",
-      id: "back_btn",
-      label: "← Back to suggestions",
-      style: "secondary",
-      action: { type: "submit" }
-    });
   }
 
   return {
@@ -1081,13 +1078,16 @@ app.post('/intercom/submit', async (req, res) => {
       return res.status(200).end();
     }
 
-    // Back to suggestions
-    if (componentId === 'back_btn' && storedConvQuery) {
-      const articles    = await getArticles();
-      const rawResults  = searchArticles(articles, storedConvQuery);
-      const suggestions = applyContextBoosts(articles, rawResults, storedCtx);
-      const backConvCtx = { text: storedConvQuery, inboxName: '', tags: [], topic: '' };
-      return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx));
+    // Back to suggestions (or clear results if no conv context)
+    if (componentId === 'back_btn') {
+      if (storedConvQuery) {
+        const articles    = await getArticles();
+        const rawResults  = searchArticles(articles, storedConvQuery);
+        const suggestions = applyContextBoosts(articles, rawResults, storedCtx);
+        const backConvCtx = { text: storedConvQuery, inboxName: '', tags: [], topic: '' };
+        return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx));
+      }
+      return res.json(searchOnlyCanvas);
     }
 
     const rawQuery = req.body.input_values?.search_query;
