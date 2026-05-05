@@ -247,8 +247,134 @@ function searchArticles(articles, rawQuery) {
     return { ...article, score };
   });
 
+  // Return all scored articles — callers apply context boosts then slice
   return scored
     .filter(a => a.score > 0)
+    .sort((a, b) => b.score - a.score);
+}
+
+// Maps Intercom partner slugs to keywords found in article titles
+const PARTNER_TITLE_MAP = {
+  'fram': 'fram',
+  'afklm': 'air france', 'air_france_klm': 'air france', 'air-france-klm': 'air france',
+  'kiwi': 'kiwi',
+  'singapore': 'singapore', 'singapore_airlines': 'singapore',
+  'wego': 'wego',
+  'almosafer': 'almosafer',
+  'turbopass': 'turbopass',
+  'enuygun': 'enuygun',
+  'makemytrip': 'makemytrip',
+  'evaneos': 'evaneos',
+  'barcelo': 'barcel',
+  'omio': 'omio',
+  'wifimap': 'wifimap',
+  'raileurope': 'raileurope',
+  'firsttrip': 'firsttrip',
+  'exoticca': 'exoticca',
+  'corendon': 'corendon',
+  'air_astana': 'air astana', 'air-astana': 'air astana',
+  'air_india': 'air india', 'air-india': 'air india',
+  'transavia': 'transavia',
+  'dscoop': 'dscoop',
+  'axa': 'axa',
+  'comptoir': 'comptoir',
+  'vietnamese': 'vietnamese',
+  'user_soft_launch': null, // internal — no partner article
+};
+
+function extractContactContext(body) {
+  const contact = body.contact || {};
+  const attrs   = contact.custom_attributes || {};
+
+  const esimStatus = (
+    attrs.esim_status ||
+    attrs.latest_sparks_esim_status ||
+    attrs.latest_lanck_esim_status || ''
+  ).toLowerCase();
+
+  const partnerSlug = (attrs.initial_referrer_partner_slug || '').toLowerCase().replace(/ /g, '_');
+
+  return {
+    isIOS:          !!contact.ios_device || !!contact.ios_app_version,
+    isAndroid:      !!contact.android_device || !!contact.android_app_version,
+    esimStatus,                                         // 'installed','uninstalled','enabled','disabled',''
+    esimCompatible: attrs.is_device_esim_compatible,   // true | false | null
+    fraudSuspected: attrs.fraud_suspected === true,
+    partnerSlug,                                        // e.g. 'fram', 'afklm'
+    partnerKeyword: PARTNER_TITLE_MAP[partnerSlug] ?? partnerSlug,
+    isB2B:          attrs.is_b2b === true,
+    language:       attrs.language || '',
+  };
+}
+
+function applyContextBoosts(allArticles, scored, ctx) {
+  if (!ctx) return scored.slice(0, 5);
+
+  const esimInstalled   = /installed|enabled|active/.test(ctx.esimStatus);
+  const esimUninstalled = /uninstalled|not_installed|deleted/.test(ctx.esimStatus);
+  const esimDisabled    = /disabled/.test(ctx.esimStatus);
+
+  // Build a set of article URLs already in scored results
+  const scoredUrls = new Set(scored.map(a => a.url));
+
+  // Articles to force-inject based on strong context signals (even if text score = 0)
+  const injected = [];
+
+  if (ctx.partnerKeyword) {
+    allArticles
+      .filter(a => a.title.toLowerCase().includes(ctx.partnerKeyword) && !scoredUrls.has(a.url))
+      .forEach(a => injected.push({ ...a, score: 250 }));
+  }
+  if (ctx.fraudSuspected) {
+    allArticles
+      .filter(a => a.category.toLowerCase().includes('fraud') && !scoredUrls.has(a.url))
+      .forEach(a => injected.push({ ...a, score: 180 }));
+  }
+  if (ctx.esimCompatible === false) {
+    allArticles
+      .filter(a => (a.title.toLowerCase().includes('adapter') || a.title.toLowerCase().includes('compatible')) && !scoredUrls.has(a.url))
+      .forEach(a => injected.push({ ...a, score: 200 }));
+  }
+
+  const combined = [...scored, ...injected];
+
+  return combined.map(article => {
+    let bonus = 0;
+    const title    = article.title.toLowerCase();
+    const category = article.category.toLowerCase();
+
+    if (esimUninstalled) {
+      if (category.includes('install'))                                  bonus += 150;
+      if (category.includes('connect') || category.includes('start'))   bonus -=  20;
+    }
+    if (esimInstalled) {
+      if (category.includes('connect') || category.includes('start'))   bonus +=  80;
+      if (category.includes('install') &&
+          !title.includes('reassign') && !title.includes('transfer') &&
+          !title.includes('move'))                                        bonus -=  30;
+    }
+    if (esimDisabled) {
+      if (category.includes('connect'))                                  bonus +=  60;
+      if (category.includes('account'))                                  bonus +=  40;
+    }
+    if (ctx.esimCompatible === false) {
+      if (title.includes('adapter') || title.includes('compatible'))    bonus += 200;
+    }
+    if (ctx.partnerKeyword) {
+      if (title.includes(ctx.partnerKeyword))                           bonus += 250;
+      else if (category.includes('travel partner'))                     bonus +=  40;
+    }
+    if (ctx.fraudSuspected) {
+      if (category.includes('fraud'))                                   bonus += 180;
+    }
+    if (ctx.isB2B) {
+      if (title.includes('b2b') || title.includes('business'))         bonus += 150;
+    }
+    if (ctx.isAndroid && title.includes('pixel'))                       bonus +=  60;
+    if (ctx.isIOS    && title.includes('pixel'))                        bonus -=  40;
+
+    return { ...article, score: Math.max(0, article.score + bonus) };
+  })
     .sort((a, b) => b.score - a.score)
     .slice(0, 5);
 }
@@ -289,7 +415,7 @@ function searchInputComponents() {
   ];
 }
 
-function buildSuggestionsCanvas(articles, convQuery) {
+function buildSuggestionsCanvas(articles, convQuery, ctx) {
   const components = [
     ...searchInputComponents(),
     { type: "divider" },
@@ -313,7 +439,7 @@ function buildSuggestionsCanvas(articles, convQuery) {
 
   return {
     canvas: {
-      stored_data: { conv_query: convQuery },
+      stored_data: { conv_query: convQuery, ctx: ctx || null },
       content: { components }
     }
   };
@@ -332,7 +458,7 @@ const searchOnlyCanvas = {
   }
 };
 
-function buildResultsCanvas(headerText, articles, convQuery) {
+function buildResultsCanvas(headerText, articles, convQuery, ctx) {
   const components = [
     ...searchInputComponents(),
     { type: "divider" },
@@ -372,7 +498,7 @@ function buildResultsCanvas(headerText, articles, convQuery) {
 
   return {
     canvas: {
-      stored_data: { conv_query: convQuery || '' },
+      stored_data: { conv_query: convQuery || '', ctx: ctx || null },
       content: { components }
     }
   };
@@ -404,13 +530,17 @@ app.post('/intercom/initialize', async (req, res) => {
 
   const convText = extractConversationText(req.body);
 
+  const ctx = extractContactContext(req.body);
+  console.log('Context:', JSON.stringify(ctx));
+
   if (convText) {
     try {
       const articles = await getArticles();
-      const suggestions = searchArticles(articles, convText);
+      const rawResults = searchArticles(articles, convText);
+      const suggestions = applyContextBoosts(articles, rawResults, ctx);
       if (suggestions.length > 0) {
-        console.log(`Auto-suggested ${suggestions.length} articles for: "${convText.slice(0, 80)}"`);
-        return res.json(buildSuggestionsCanvas(suggestions, convText));
+        console.log(`Auto-suggested ${suggestions.length} articles (with context boosts)`);
+        return res.json(buildSuggestionsCanvas(suggestions, convText, ctx));
       }
     } catch (err) {
       console.error('Auto-suggest error:', err.message);
@@ -425,8 +555,10 @@ app.post('/intercom/submit', async (req, res) => {
   console.log('SUBMIT component_id:', req.body.component_id);
   console.log('SUBMIT input_values:', JSON.stringify(req.body.input_values));
 
-  const componentId = req.body.component_id || '';
-  const storedConvQuery = req.body.canvas_data?.stored_data?.conv_query || '';
+  const componentId    = req.body.component_id || '';
+  const storedData     = req.body.canvas_data?.stored_data || {};
+  const storedConvQuery = storedData.conv_query || '';
+  const storedCtx      = storedData.ctx || null;
 
   // URL buttons open Notion directly — no state change needed
   if (componentId.startsWith('open_')) {
@@ -437,8 +569,9 @@ app.post('/intercom/submit', async (req, res) => {
   if (componentId === 'back_btn' && storedConvQuery) {
     try {
       const articles = await getArticles();
-      const suggestions = searchArticles(articles, storedConvQuery);
-      return res.json(buildSuggestionsCanvas(suggestions, storedConvQuery));
+      const rawResults = searchArticles(articles, storedConvQuery);
+      const suggestions = applyContextBoosts(articles, rawResults, storedCtx);
+      return res.json(buildSuggestionsCanvas(suggestions, storedConvQuery, storedCtx));
     } catch (err) {
       console.error('Back error:', err.message);
       return res.json(searchOnlyCanvas);
@@ -456,9 +589,10 @@ app.post('/intercom/submit', async (req, res) => {
 
   try {
     const articles = await getArticles();
-    const results = searchArticles(articles, query);
-    console.log(`Found ${results.length} results for "${query}"`);
-    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery));
+    const rawResults = searchArticles(articles, query);
+    const results = applyContextBoosts(articles, rawResults, storedCtx);
+    console.log(`Found ${results.length} results for "${query}" (context: esim=${storedCtx?.esimStatus}, partner=${storedCtx?.partnerSlug})`);
+    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery, storedCtx));
   } catch (err) {
     console.error('Search error:', err.message);
     return res.json(buildErrorCanvas());
