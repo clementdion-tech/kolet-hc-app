@@ -307,11 +307,17 @@ function extractContactContext(body) {
   const planZone = (attrs.current_plan_zone_code || attrs.initial_gift_zone_code || '').toLowerCase();
   const isRestrictedCountry = RESTRICTED_COUNTRIES.has(planZone);
 
+  // Chinese-market device brands often have eSIM installation quirks
+  const CHINESE_BRANDS = new Set(['oppo','huawei','xiaomi','oneplus','realme','vivo','honor','zte','meizu','lenovo','tcl','tecno','infinix','nothing']);
+  const deviceBrand = (attrs.device_brand || '').toLowerCase();
+  const isChineseDevice = CHINESE_BRANDS.has(deviceBrand);
+
   return {
     // Device
     isIOS:             !!contact.ios_device   || !!contact.ios_app_version,
     isAndroid:         !!contact.android_device || !!contact.android_app_version,
-    deviceBrand:       (attrs.device_brand || '').toLowerCase(),
+    deviceBrand,
+    isChineseDevice,
 
     // eSIM
     esimStatus,
@@ -332,6 +338,9 @@ function extractContactContext(body) {
     partnerKeyword:    PARTNER_TITLE_MAP[partnerSlug] ?? (partnerSlug.replace(/_/g, ' ') || null),
     hasFlyingBlue:     !!(attrs.flying_blue_number),
 
+    // eSIM identifiers
+    esimIccid:         attrs.esim_iccid || null,
+
     // Account
     fraudSuspected:    attrs.fraud_suspected === true,
     isB2B:             attrs.is_b2b === true,
@@ -339,6 +348,26 @@ function extractContactContext(body) {
     hasReferred:       attrs.has_referred === true,
     language:          attrs.language || '',
   };
+}
+
+// Returns a specific hint string when contact data maps to a known installation sub-case
+function getInstallationHint(ctx) {
+  if (!ctx) return null;
+  const esimInstalled = /installed|enabled|active/.test(ctx.esimStatus);
+
+  if (ctx.esimCompatible === false)
+    return 'Check 3.2 — device not compatible';
+  if (ctx.isChineseDevice)
+    return `Check 3.6 — ${ctx.deviceBrand} device (China/HK/Macao)`;
+  if (ctx.esimInstallCount >= 3 && ctx.isOneClick === false)
+    return 'Check 3.0 — 1-click install limit reached (3×)';
+  if (ctx.esimInstallCount > 1)
+    return 'Check 3.7 — eSIM previously installed on another device';
+  if (esimInstalled && ctx.dataNeverUsed && ctx.esimLastCountry === null)
+    return 'Check 3.9 — eSIM installed but not yet active';
+  if (!ctx.esimIccid && !esimInstalled)
+    return 'Check 3.10 — no eSIM linked to account';
+  return null;
 }
 
 function applyContextBoosts(allArticles, scored, ctx) {
@@ -518,6 +547,8 @@ function buildSuggestionsCanvas(articles, convQuery, ctx) {
     { type: "text", text: "Suggested articles", style: "header" },
   ];
 
+  const installHint = ctx ? getInstallationHint(ctx) : null;
+
   for (let i = 0; i < articles.length; i++) {
     const article = articles[i];
     components.push({ type: "divider" });
@@ -531,6 +562,9 @@ function buildSuggestionsCanvas(articles, convQuery, ctx) {
       style: "link",
       action: { type: "url", url: article.url }
     });
+    if (installHint && article.category.toLowerCase().includes('install')) {
+      components.push({ type: "text", text: `⚡ ${installHint}`, style: "muted" });
+    }
   }
 
   return {
@@ -561,6 +595,8 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx) {
     { type: "text", text: headerText, style: "header" },
   ];
 
+  const installHint = ctx ? getInstallationHint(ctx) : null;
+
   if (articles.length === 0) {
     components.push({ type: "text", text: "No articles found.", style: "muted" });
   } else {
@@ -577,6 +613,9 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx) {
         style: "link",
         action: { type: "url", url: article.url }
       });
+      if (installHint && article.category.toLowerCase().includes('install')) {
+        components.push({ type: "text", text: `⚡ ${installHint}`, style: "muted" });
+      }
     }
   }
 
