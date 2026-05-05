@@ -508,9 +508,9 @@ function getArticleHint(article, ctx) {
     // Key learning: if eSIM is already installed, the real issue is finding it in settings
     if (esimInstalled && ctx.esimInstallCount >= 1) {
       if (ctx.isIOS)
-        return 'eSIM already installed — check Settings › Mobile Data (may show as Secondary/Travel/Business)';
+        return 'eSIM already installed — check Settings > Mobile Data (may show as Secondary/Travel/Business)';
       if (ctx.isAndroid)
-        return 'eSIM already installed — check Settings › Network › SIM cards';
+        return 'eSIM already installed — check Settings > Network > SIM cards';
       return 'eSIM already installed — ask customer to check phone SIM settings';
     }
     if (ctx.esimCompatible === false)
@@ -532,9 +532,9 @@ function getArticleHint(article, ctx) {
       title.includes('show') || title.includes('visible') || title.includes('appear')) {
     if (esimInstalled) {
       if (ctx.isIOS)
-        return 'eSIM installed — check Settings › Mobile Data (may show as Secondary/Travel/Business)';
+        return 'eSIM installed — check Settings > Mobile Data (may show as Secondary/Travel/Business)';
       if (ctx.isAndroid)
-        return 'eSIM installed — check Settings › Network › SIM cards (or Connections)';
+        return 'eSIM installed — check Settings > Network > SIM cards (or Connections)';
     }
     if (!esimInstalled)
       return 'eSIM not yet installed — may need QR scan first';
@@ -1036,88 +1036,89 @@ function buildErrorCanvas(msg) {
 app.get('/intercom/initialize', (req, res) => res.json(searchOnlyCanvas));
 
 app.post('/intercom/initialize', async (req, res) => {
-  lastInit = req.body;
+  try {
+    lastInit = req.body;
 
-  const convCtx = extractConversationContext(req.body);
-  const ctx     = extractContactContext(req.body);
+    const convCtx = extractConversationContext(req.body);
+    const ctx     = extractContactContext(req.body);
 
-  console.log('INIT inbox:', convCtx.inboxName, '| tags:', convCtx.tags, '| topic:', convCtx.topic);
-  console.log('INIT text (first 200):', convCtx.text.slice(0, 200));
-  console.log('INIT contact ctx:', JSON.stringify(ctx));
+    console.log('INIT inbox:', convCtx.inboxName, '| topic:', convCtx.topic);
+    console.log('INIT text (first 200):', convCtx.text.slice(0, 200));
+    console.log('INIT esim:', ctx.esimStatus, '| partner:', ctx.partnerSlug);
 
-  const augmentedQuery = buildConvSearchQuery(convCtx);
+    const augmentedQuery = buildConvSearchQuery(convCtx);
 
-  if (augmentedQuery) {
-    try {
+    if (augmentedQuery) {
       const articles    = await getArticles();
       const rawResults  = searchArticles(articles, augmentedQuery);
       const suggestions = applyContextBoosts(articles, rawResults, ctx);
       if (suggestions.length > 0) {
-        console.log(`Suggested ${suggestions.length} articles | inbox="${convCtx.inboxName}" tags=[${convCtx.tags}]`);
+        console.log(`Suggested ${suggestions.length} articles for inbox="${convCtx.inboxName}"`);
         return res.json(buildSuggestionsCanvas(suggestions, convCtx, ctx));
       }
-    } catch (err) {
-      console.error('Auto-suggest error:', err.message);
     }
-  }
 
-  res.json(searchOnlyCanvas);
+    return res.json(searchOnlyCanvas);
+  } catch (err) {
+    lastError = { route: 'init', message: err.message, stack: err.stack, time: new Date().toISOString() };
+    console.error('INIT ERROR:', err.message, err.stack);
+    return res.json(searchOnlyCanvas);
+  }
 });
 
 app.post('/intercom/submit', async (req, res) => {
-  lastSubmit = req.body;
-  console.log('SUBMIT component_id:', req.body.component_id);
-  console.log('SUBMIT input_values:', JSON.stringify(req.body.input_values));
+  try {
+    lastSubmit = req.body;
+    console.log('SUBMIT component_id:', req.body.component_id);
 
-  const componentId    = req.body.component_id || '';
-  const storedData     = req.body.canvas_data?.stored_data || {};
-  const storedConvQuery = storedData.conv_query || '';
-  const storedCtx      = storedData.ctx || null;
+    const componentId    = req.body.component_id || '';
+    const storedData     = req.body.canvas_data?.stored_data || {};
+    const storedConvQuery = storedData.conv_query || '';
+    const storedCtx      = storedData.ctx || null;
 
-  // URL buttons open Notion directly — no state change needed
-  if (componentId.startsWith('open_')) {
-    return res.status(200).end();
-  }
+    // URL buttons open Notion directly — no state change needed
+    if (componentId.startsWith('open_')) {
+      return res.status(200).end();
+    }
 
-  // Back to suggestions — re-run stored query with same context
-  if (componentId === 'back_btn' && storedConvQuery) {
-    try {
+    // Back to suggestions
+    if (componentId === 'back_btn' && storedConvQuery) {
       const articles    = await getArticles();
       const rawResults  = searchArticles(articles, storedConvQuery);
       const suggestions = applyContextBoosts(articles, rawResults, storedCtx);
-      // Reconstruct a minimal convCtx so the label still shows inbox name if present
       const backConvCtx = { text: storedConvQuery, inboxName: '', tags: [], topic: '' };
       return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx));
-    } catch (err) {
-      console.error('Back error:', err.message);
-      return res.json(searchOnlyCanvas);
     }
-  }
 
-  const rawQuery = req.body.input_values?.search_query;
-  const query    = sanitizeQuery(rawQuery);
+    const rawQuery = req.body.input_values?.search_query;
+    const query    = sanitizeQuery(rawQuery);
+    console.log(`Search: "${rawQuery}" -> "${query}"`);
 
-  console.log(`Raw query: "${rawQuery}" → sanitized: "${query}"`);
+    if (!query) return res.json(searchOnlyCanvas);
 
-  if (!query) {
-    return res.json(searchOnlyCanvas);
-  }
-
-  try {
     const articles   = await getArticles();
     const rawResults = searchArticles(articles, query);
     const results    = applyContextBoosts(articles, rawResults, storedCtx);
-    console.log(`Found ${results.length} results for "${query}" (esim=${storedCtx?.esimStatus}, partner=${storedCtx?.partnerSlug})`);
-    // Pass storedConvQuery as a flag — if non-empty, back button appears
+    console.log(`Found ${results.length} for "${query}"`);
     return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery || null, storedCtx));
+
   } catch (err) {
-    console.error('Search error:', err.message);
+    lastError = { route: 'submit', message: err.message, stack: err.stack, time: new Date().toISOString() };
+    console.error('SUBMIT ERROR:', err.message, err.stack);
     return res.json(buildErrorCanvas());
   }
 });
 
+// Global Express error handler — last resort, returns valid Canvas response
+app.use((err, req, res, next) => {
+  console.error('EXPRESS ERROR:', err.message, err.stack);
+  res.status(200).json(searchOnlyCanvas);
+});
+
 // Debug endpoints
-app.get('/debug/last-init', (req, res) => res.json(lastInit));
+let lastError = {};
+app.get('/debug/last-init',   (req, res) => res.json(lastInit));
+app.get('/debug/last-error',  (req, res) => res.json(lastError));
 app.get('/debug/last-submit', (req, res) => res.json(lastSubmit));
 app.get('/debug/search', async (req, res) => {
   const q = req.query.q || '';
