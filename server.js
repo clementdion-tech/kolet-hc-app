@@ -128,7 +128,7 @@ const DOMAIN_TERMS = new Set([
   'esim','sim','apn','iccid','qr','roaming','refund','invoice','wallet',
   'koin','koins','fraud','install','activate','activation','connectivity',
   'compatible','compatibility','profile','carrier','network','plan','bundle',
-  'expire','transfer','reassign','migrate','migration','voucher','referral',
+  'expire','transfer','reassign','reassignment','migrate','migration','voucher','referral',
   'promo','miles','loyalty','partner','otp','verification','password',
   'login','account','billing','payment','credit','balance','topup','adapter',
   'android','iphone','pixel','samsung','huawei','xiaomi','oppo',
@@ -137,6 +137,11 @@ const DOMAIN_TERMS = new Set([
   'reimbursement','cashback','uninstall','reinstall','reactivate','disable',
   'enabled','disabled','installed','detected','coverage','bandwidth','speed',
   'throttle','expire','renewal','extend','top','topup','b2b','enterprise',
+  // eSIM types & labels users actually see on their device
+  'sparks','lanck','valid','plus','tim','proximus',
+  // eSIM/device troubleshooting terms
+  'imei','sos','greyed','grayed','defective','reassign','subscription',
+  'nperf','relay','privaterelay','domain','disposable',
   // New from conversation analysis
   'locate','locate esim','find esim','secondary','countdown','validity','consent',
   'gift','donation','convert','unused','koins','koin','remaining','leftover',
@@ -222,11 +227,18 @@ const SYNONYMS = {
   locate:       ['find my esim','cant find','cannot find','not showing','not visible','not appearing',
                  'disappeared','where is my esim','see my esim','show esim','secondary sim',
                  'business line','travel sim','mobile data label','which sim is kolet',
-                 'find esim','locate esim','see esim','esim not showing','esim disappeared'],
+                 'find esim','locate esim','see esim','esim not showing','esim disappeared',
+                 // Device label confusion — eSIM shows as Plus/TIM/Orange/Proximus, not "Kolet"
+                 'kolet plus','kolet tim','kolet lt','kolet sp','kolet lo','kolet orange',
+                 'shows as plus','shows as tim','called plus','called tim','named plus','named tim',
+                 'plus sim','tim sim','orange sim','proximus sim','sim called','which is mine',
+                 'two sims','two sim cards','which line is','my esim is called'],
 
   // ── Connectivity ─────────────────────────────────────────────────────────
   connection:   ['connect','connectivity','signal','network','no data','internet','roaming','apn',
-                 'not connecting','not working','no service','no internet','not getting service'],
+                 'not connecting','not working','no service','no internet','not getting service',
+                 'sos','sos only','greyed','greyed out','grayed','grayed out','grey toggle',
+                 'gray toggle','toggle grey','toggle gray','esim greyed','toggle disabled'],
   internet:     ['connection','data','connectivity','apn','network'],
   slow:         ['speed','slow connection','connectivity','throttle','throttled'],
   roaming:      ['connection','apn','network','abroad','travel','international',
@@ -236,7 +248,8 @@ const SYNONYMS = {
                  'international calls','appels','llamadas'],
 
   // ── Transfer / device change ─────────────────────────────────────────────
-  transfer:     ['move','switch','reassign','new phone','new device','change device','migrate','migration'],
+  transfer:     ['move','switch','reassign','new phone','new device','change device','migrate','migration',
+                 'defective','broken','repair','replaced phone','phone broken','faulty','factory reset'],
   // NEW — data gifting / donation (distinct from device transfer)
   gift:         ['gift data','gifted','gift my gb','data donation','donate data','wrong email',
                  'recipient','receiver','reciever','regalo','cadeau','gifted to wrong','sent to wrong'],
@@ -252,11 +265,18 @@ const SYNONYMS = {
                  'données inutilisées','reconvertir','remaining data','leftover data'],
 
   // ── Account / login ──────────────────────────────────────────────────────
-  login:        ['sign in','log in','otp','password','access','verification','code'],
+  login:        ['sign in','log in','otp','password','access','verification','code',
+                 // Apple iCloud Private Relay blocks OTP delivery
+                 'apple relay','icloud relay','private relay','privaterelay','hide my email',
+                 'apple email','icloud email','@privaterelay.appleid.com',
+                 'not receiving code','code not received','otp not arriving','no otp'],
   account:      ['login','profile','delete','unsubscribe',
                  // T&C consent checkbox — came up repeatedly
                  'terms and conditions','consent','checkbox','check off','tick the box',
-                 'cgv','conditions générales','consentement','terms','conditions'],
+                 'cgv','conditions générales','consentement','terms','conditions',
+                 // Blocked/disposable email domain
+                 'domain blocked','email blocked','disposable email','blocked email','temporary email',
+                 'cant register','cannot register','no registration','signup blocked'],
 
   // ── Vouchers / promo ─────────────────────────────────────────────────────
   // Key learning: promo code VALIDITY questions are NOT fraud — separate intent
@@ -281,9 +301,17 @@ const SYNONYMS = {
   miles:        ['flying blue','afklm','air france','klm','points','loyalty','mileage'],
   partner:      ['travel partner','airline','afklm','air france','flying blue'],
 
-  // ── Fraud ────────────────────────────────────────────────────────────────
-  blocked:      ['fraud','ban','banned','suspended','disposable','email'],
-  fraud:        ['scam','suspicious','blocked','fake','disposable'],
+  // ── Government / device restrictions ────────────────────────────────────
+  imei:         ['imei blocked','imei ban','imei number','device blocked','government block',
+                 'egypt','egyptian','turkey','turkish','registration','nra','btk',
+                 'register phone','phone registration','blocked by government',
+                 'roaming not available','restricted country'],
+
+  // ── Fraud / blocked accounts ─────────────────────────────────────────────
+  blocked:      ['fraud','ban','banned','suspended','disposable','email',
+                 'fraudster','stolen','compromised','hacked','hijacked'],
+  fraud:        ['scam','suspicious','blocked','fake','disposable',
+                 'fraudster','stolen','compromised','unauthorized','fraudulent'],
 };
 
 function sanitizeQuery(raw) {
@@ -532,7 +560,7 @@ function getArticleHint(article, ctx) {
       title.includes('show') || title.includes('visible') || title.includes('appear')) {
     if (esimInstalled) {
       if (ctx.isIOS)
-        return 'eSIM installed — check Settings > Mobile Data (may show as Secondary/Travel/Business)';
+        return "eSIM installed — check Settings > Mobile Data (may show as 'Plus', 'TIM', 'Orange' or 'Proximus', NOT 'Kolet')";
       if (ctx.isAndroid)
         return 'eSIM installed — check Settings > Network > SIM cards (or Connections)';
     }
@@ -543,9 +571,12 @@ function getArticleHint(article, ctx) {
   // ── Connection / start using / APN ────────────────────────────────────────
   if (category.includes('connect') || category.includes('start using') ||
       title.includes('apn') || title.includes('connect') || title.includes('no data') ||
-      title.includes('internet') || title.includes('roaming') || title.includes('signal')) {
+      title.includes('internet') || title.includes('roaming') || title.includes('signal') ||
+      title.includes('sos') || title.includes('grey') || title.includes('gray')) {
     if (ctx.isRestrictedCountry)
       return `Destination: ${ctx.planZone.toUpperCase()} — government restrictions may apply`;
+    if (esimDisabled)
+      return 'eSIM disabled — toggle may appear greyed out; check account status';
     if (ctx.dataNeverUsed && esimInstalled) {
       if (title.includes('apn'))
         return 'eSIM installed — verify APN settings';
@@ -555,8 +586,6 @@ function getArticleHint(article, ctx) {
       return 'Check: roaming enabled + Kolet set as primary data SIM';
     if (ctx.dataExpired)
       return 'Data plan expired — renewal needed before reconnecting';
-    if (esimDisabled)
-      return 'eSIM disabled — check account status';
     if (ctx.isAndroid)
       return 'Android device — check roaming + Kolet as primary data SIM';
   }
@@ -871,7 +900,7 @@ const CATEGORY_EMOJI_MAP = [
   [['refund', 'reimburse', 'cashback', 'billing', 'invoice', 'payment',
     'money', 'wallet', 'koin'],                                           '💰'],
   [['account', 'login', 'sign in', 'otp', 'password', 'delete account'], '🔑'],
-  [['fraud', 'ban', 'suspend', 'blocked', 'disposable'],                 '🚨'],
+  [['fraud', 'fraudster', 'ban', 'suspend', 'blocked', 'disposable'],   '🚨'],
   [['transfer', 'reassign', 'move esim', 'new device', 'new phone',
     'change device', 'migrate'],                                          '🔄'],
   [['extend', 'renew', 'top up', 'bundle', 'data plan', 'gb', 'usage'],  '📦'],
