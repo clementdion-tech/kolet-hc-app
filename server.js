@@ -5,10 +5,40 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
+// --- Debug: store last request bodies ---
+let lastInit = {};
+let lastSubmit = {};
+
 // --- Notion cache ---
 let articleCache = null;
 let cacheExpiry = 0;
 const CACHE_TTL = 5 * 60 * 1000;
+
+async function fetchPageText(pageId) {
+  try {
+    const res = await fetch(
+      `https://api.notion.com/v1/blocks/${pageId}/children?page_size=50`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.NOTION_TOKEN}`,
+          'Notion-Version': '2022-06-28',
+        },
+      }
+    );
+    const data = await res.json();
+    if (!res.ok) return '';
+    return (data.results || [])
+      .map(block => {
+        const type = block.type;
+        const richText = block[type]?.rich_text || [];
+        return richText.map(t => t.plain_text).join('');
+      })
+      .join(' ')
+      .toLowerCase();
+  } catch {
+    return '';
+  }
+}
 
 async function getArticles() {
   if (articleCache && Date.now() < cacheExpiry) return articleCache;
@@ -48,7 +78,7 @@ async function getArticles() {
       const pageId = page.id.replace(/-/g, '');
       const url = `https://www.notion.so/kolet/${pageId}`;
 
-      results.push({ title, category, keywords, url });
+      results.push({ title, category, keywords, content: '', url, pageId: page.id });
     }
 
     cursor = data.has_more ? data.next_cursor : undefined;
@@ -56,28 +86,75 @@ async function getArticles() {
 
   articleCache = results;
   cacheExpiry = Date.now() + CACHE_TTL;
-  console.log(`Cached ${results.length} articles from Notion`);
+  console.log(`Cached ${results.length} articles`);
+
+  // Fetch page content in background (3 at a time, 300ms gap to avoid rate limits)
+  enrichArticleContent(results);
+
   return results;
 }
 
-function searchArticles(articles, query) {
-  const q = query.toLowerCase().trim();
-  const words = q.split(/\s+/).filter(w => w.length > 2);
+async function enrichArticleContent(articles) {
+  for (let i = 0; i < articles.length; i += 3) {
+    const batch = articles.slice(i, i + 3);
+    await Promise.all(
+      batch.map(async (article) => {
+        if (!article.content) {
+          article.content = await fetchPageText(article.pageId);
+        }
+      })
+    );
+    if (i + 3 < articles.length) {
+      await new Promise(r => setTimeout(r, 300));
+    }
+  }
+  console.log('Article content enrichment complete');
+}
+
+function sanitizeQuery(raw) {
+  if (!raw) return '';
+  // Strip anything that isn't a letter, digit, space, hyphen, or apostrophe
+  return raw.replace(/[^\w\s\-']/g, '').trim().toLowerCase();
+}
+
+function searchArticles(articles, rawQuery) {
+  const q = sanitizeQuery(rawQuery);
+  if (!q) return [];
+
+  const words = q.split(/\s+/).filter(w => w.length > 1);
 
   const scored = articles.map(article => {
     const titleLower = article.title.toLowerCase();
     const categoryLower = article.category.toLowerCase();
+    const keywordsLower = article.keywords;
+    const contentLower = article.content || '';
     let score = 0;
 
-    if (titleLower === q) score += 200;
-    else if (titleLower.includes(q)) score += 100;
-    if (categoryLower.includes(q)) score += 50;
-    if (article.keywords.includes(q)) score += 40;
+    // Exact title match
+    if (titleLower === q) score += 300;
+    else if (titleLower.includes(q)) score += 150;
 
+    // Category match
+    if (categoryLower.includes(q)) score += 60;
+
+    // Keyword field match
+    if (keywordsLower.includes(q)) score += 50;
+
+    // Full content match
+    if (contentLower.includes(q)) score += 40;
+
+    // Per-word scoring
     for (const word of words) {
-      if (titleLower.includes(word)) score += 30;
+      if (titleLower.includes(word)) score += 40;
       if (categoryLower.includes(word)) score += 20;
-      if (article.keywords.includes(word)) score += 10;
+      if (keywordsLower.includes(word)) score += 15;
+      if (contentLower.includes(word)) score += 10;
+
+      // Prefix match: "refund" matches "refunds"
+      const titleWords = titleLower.split(/[\s:,\-&]+/);
+      for (const tw of titleWords) {
+        if (tw.startsWith(word) || word.startsWith(tw)) score += 20;
+      }
     }
 
     return { ...article, score };
@@ -89,38 +166,58 @@ function searchArticles(articles, query) {
     .slice(0, 5);
 }
 
-// Extract plain text from an Intercom conversation object
 function extractConversationText(body) {
   const conv = body.conversation || {};
   const parts = [
     conv.source?.subject,
     conv.source?.body,
     conv.first_contact_reply?.body,
-    body.contact?.name,
   ].filter(Boolean);
 
   return parts
     .join(' ')
-    .replace(/<[^>]*>/g, ' ')  // strip HTML tags
+    .replace(/<[^>]*>/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
 // --- Canvas builders ---
 
-const searchCanvas = {
+function searchInputComponents(prefill = '') {
+  return [
+    { type: "divider" },
+    { type: "text", text: "Search articles", style: "muted" },
+    {
+      type: "input",
+      id: "search_query",
+      label: "",
+      placeholder: "e.g. refund, no connection, eSIM...",
+      value: prefill,
+      action: { type: "submit" }
+    },
+    {
+      type: "button",
+      id: "search_btn",
+      label: "Search",
+      style: "primary",
+      action: { type: "submit" }
+    }
+  ];
+}
+
+const searchOnlyCanvas = {
   canvas: {
     stored_data: {},
     content: {
       components: [
-        { type: "text", text: "KokoBrain Search", style: "header" },
-        { type: "text", text: "Search the internal knowledge base", style: "muted" },
+        { type: "text", text: "KokoBrain", style: "header" },
+        { type: "text", text: "Find internal knowledge articles", style: "muted" },
         { type: "spacer", size: "s" },
         {
           type: "input",
           id: "search_query",
           label: "Search",
-          placeholder: "e.g. refund, eSIM install, no connection...",
+          placeholder: "e.g. refund, no connection, eSIM install...",
           action: { type: "submit" }
         },
         {
@@ -135,23 +232,22 @@ const searchCanvas = {
   }
 };
 
-function buildResultsCanvas(label, articles, showSearchLink = true) {
+function buildResultsCanvas(headerText, articles) {
   const components = [
-    { type: "text", text: label, style: "header" },
-    { type: "divider" }
+    { type: "text", text: headerText, style: "header" },
   ];
 
   if (articles.length === 0) {
-    components.push({ type: "text", text: "No articles found. Try different keywords.", style: "muted" });
+    components.push({ type: "divider" });
+    components.push({ type: "text", text: "No articles found.", style: "muted" });
   } else {
-    articles.forEach((article, i) => {
-      // Category tag
+    for (let i = 0; i < articles.length; i++) {
+      const article = articles[i];
+      components.push({ type: "divider" });
       if (article.category) {
-        components.push({ type: "text", text: article.category, style: "muted" });
+        components.push({ type: "text", text: article.category.toUpperCase(), style: "muted" });
       }
-      // Article title — prominent
       components.push({ type: "text", text: article.title, style: "header" });
-      // Open button with unique id
       components.push({
         type: "button",
         id: `open_${i}`,
@@ -159,21 +255,11 @@ function buildResultsCanvas(label, articles, showSearchLink = true) {
         style: "secondary",
         action: { type: "url", url: article.url }
       });
-      components.push({ type: "spacer", size: "s" });
-    });
+    }
   }
 
-  components.push({ type: "divider" });
-
-  if (showSearchLink) {
-    components.push({
-      type: "button",
-      id: "back_btn",
-      label: "Search manually",
-      style: "secondary",
-      action: { type: "submit" }
-    });
-  }
+  // Always show search at the bottom
+  components.push(...searchInputComponents());
 
   return {
     canvas: {
@@ -183,20 +269,14 @@ function buildResultsCanvas(label, articles, showSearchLink = true) {
   };
 }
 
-function buildErrorCanvas(message = "Could not reach Notion. Please try again.") {
+function buildErrorCanvas(msg) {
   return {
     canvas: {
       stored_data: {},
       content: {
         components: [
-          { type: "text", text: message, style: "muted" },
-          {
-            type: "button",
-            id: "back_btn",
-            label: "Back to search",
-            style: "secondary",
-            action: { type: "submit" }
-          }
+          { type: "text", text: msg || "Something went wrong. Try again.", style: "muted" },
+          ...searchInputComponents()
         ]
       }
     }
@@ -205,62 +285,73 @@ function buildErrorCanvas(message = "Could not reach Notion. Please try again.")
 
 // --- Routes ---
 
-app.get('/intercom/initialize', (req, res) => res.json(searchCanvas));
+app.get('/intercom/initialize', (req, res) => res.json(searchOnlyCanvas));
 
 app.post('/intercom/initialize', async (req, res) => {
-  console.log('INITIALIZE body:', JSON.stringify(req.body, null, 2));
+  lastInit = req.body;
+  console.log('INIT component_id:', req.body.component_id);
+  console.log('INIT input_values:', JSON.stringify(req.body.input_values));
+  console.log('INIT conversation text:', extractConversationText(req.body).slice(0, 200));
 
-  const conversationText = extractConversationText(req.body);
-  console.log('Conversation text:', conversationText);
+  const convText = extractConversationText(req.body);
 
-  if (conversationText) {
+  if (convText) {
     try {
       const articles = await getArticles();
-      const suggestions = searchArticles(articles, conversationText);
+      const suggestions = searchArticles(articles, convText);
       if (suggestions.length > 0) {
-        console.log(`Auto-suggested ${suggestions.length} articles`);
-        return res.json(buildResultsCanvas('Suggested articles', suggestions, true));
+        console.log(`Auto-suggested ${suggestions.length} articles for: "${convText.slice(0, 80)}"`);
+        return res.json(buildResultsCanvas('Suggested articles', suggestions));
       }
     } catch (err) {
       console.error('Auto-suggest error:', err.message);
     }
   }
 
-  res.json(searchCanvas);
+  res.json(searchOnlyCanvas);
 });
 
 app.post('/intercom/submit', async (req, res) => {
-  console.log('SUBMIT body:', JSON.stringify(req.body, null, 2));
+  lastSubmit = req.body;
+  console.log('SUBMIT component_id:', req.body.component_id);
+  console.log('SUBMIT input_values:', JSON.stringify(req.body.input_values));
 
-  if (req.body.component_id === 'back_btn') {
-    return res.json(searchCanvas);
+  const componentId = req.body.component_id || '';
+
+  // URL buttons open Notion directly — Intercom still calls submit, return current search
+  if (componentId.startsWith('open_')) {
+    return res.json(searchOnlyCanvas);
   }
 
-  // Ignore URL button clicks — they open Notion directly, no server response needed
-  if (req.body.component_id?.startsWith('open_')) {
-    return res.json(searchCanvas);
-  }
+  const rawQuery = req.body.input_values?.search_query;
+  const query = sanitizeQuery(rawQuery);
 
-  const query = req.body.input_values?.search_query?.trim();
+  console.log(`Raw query: "${rawQuery}" → sanitized: "${query}"`);
 
   if (!query) {
-    return res.json(searchCanvas);
+    return res.json(searchOnlyCanvas);
   }
-
-  console.log(`Searching for: "${query}"`);
 
   try {
     const articles = await getArticles();
     const results = searchArticles(articles, query);
-    console.log(`Found ${results.length} articles`);
-    return res.json(buildResultsCanvas(`Results for "${query}"`, results, true));
+    console.log(`Found ${results.length} results for "${query}"`);
+    return res.json(buildResultsCanvas(`Results for "${query}"`, results));
   } catch (err) {
     console.error('Search error:', err.message);
     return res.json(buildErrorCanvas());
   }
 });
 
-// Health check
+// Debug endpoints
+app.get('/debug/last-init', (req, res) => res.json(lastInit));
+app.get('/debug/last-submit', (req, res) => res.json(lastSubmit));
+app.get('/debug/search', async (req, res) => {
+  const q = req.query.q || '';
+  const articles = await getArticles();
+  const results = searchArticles(articles, q);
+  res.json({ query: q, sanitized: sanitizeQuery(q), count: results.length, results });
+});
 app.get('/health', (req, res) => res.json({ ok: true, cached: articleCache?.length || 0 }));
 
 getArticles().catch(err => console.error('Cache warm failed:', err.message));
