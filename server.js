@@ -5,18 +5,104 @@ require('dotenv').config();
 const app = express();
 app.use(express.json());
 
+// --- Notion cache ---
+let articleCache = null;
+let cacheExpiry = 0;
+const CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+async function getArticles() {
+  if (articleCache && Date.now() < cacheExpiry) return articleCache;
+
+  const results = [];
+  let cursor = undefined;
+
+  do {
+    const body = { page_size: 100 };
+    if (cursor) body.start_cursor = cursor;
+
+    const res = await fetch(
+      `https://api.notion.com/v1/databases/${process.env.NOTION_DATABASE_ID}/query`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${process.env.NOTION_TOKEN}`,
+          'Notion-Version': '2022-06-28',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      }
+    );
+
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.message || 'Notion API error');
+
+    for (const page of data.results) {
+      const props = page.properties;
+      const titleArr = props.Nom?.title || [];
+      const title = titleArr.map(t => t.plain_text).join('').trim();
+      if (!title) continue;
+
+      const category = props.Day?.select?.name || '';
+      const textArr = props.Text?.rich_text || [];
+      const keywords = textArr.map(t => t.plain_text).join(' ').toLowerCase();
+      const pageId = page.id.replace(/-/g, '');
+      const url = `https://www.notion.so/kolet/${pageId}`;
+
+      results.push({ title, category, keywords, url });
+    }
+
+    cursor = data.has_more ? data.next_cursor : undefined;
+  } while (cursor);
+
+  articleCache = results;
+  cacheExpiry = Date.now() + CACHE_TTL;
+  console.log(`📚 Cached ${results.length} articles from Notion`);
+  return results;
+}
+
+function searchArticles(articles, query) {
+  const q = query.toLowerCase().trim();
+  const words = q.split(/\s+/);
+
+  const scored = articles.map(article => {
+    const titleLower = article.title.toLowerCase();
+    const categoryLower = article.category.toLowerCase();
+    let score = 0;
+
+    if (titleLower === q) score += 200;
+    else if (titleLower.includes(q)) score += 100;
+    if (categoryLower.includes(q)) score += 50;
+    if (article.keywords.includes(q)) score += 40;
+
+    for (const word of words) {
+      if (word.length < 2) continue;
+      if (titleLower.includes(word)) score += 30;
+      if (categoryLower.includes(word)) score += 20;
+      if (article.keywords.includes(word)) score += 10;
+    }
+
+    return { ...article, score };
+  });
+
+  return scored
+    .filter(a => a.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 5);
+}
+
+// --- Canvas UI ---
 const searchUI = {
   canvas: {
     content: {
       components: [
         { type: "text", text: "🧠 KokoBrain Search", style: "header" },
-        { type: "text", text: "Search your internal knowledge base to help customers", style: "muted" },
+        { type: "text", text: "Search the internal knowledge base", style: "muted" },
         { type: "spacer", size: "s" },
         {
           type: "input",
           id: "search_query",
           label: "Search",
-          placeholder: "e.g. eSIM activation, data not working, refund...",
+          placeholder: "e.g. refund, eSIM install, no connection...",
           action: { type: "submit" }
         },
         {
@@ -31,172 +117,27 @@ const searchUI = {
   }
 };
 
-// Handle both GET and POST for initialize
-app.get('/intercom/initialize', (req, res) => {
-  res.json(searchUI);
-});
-
-app.post('/intercom/initialize', (req, res) => {
-  res.json(searchUI);
-});
-
-// Handle both GET and POST for submit
-app.get('/intercom/submit', async (req, res) => {
-  res.json(searchUI);
-});
-
-app.post('/intercom/submit', async (req, res) => {
-  const query = req.body.input_values?.search_query;
-
-  if (req.body.component_id === 'back_btn' || !query) {
-    return res.json(searchUI);
-  }
-
-  try {
-    console.log(`🔍 Searching KokoBrain for: "${query}"`);
-    const articles = await debugKokoBrainContent(query);
-    console.log(`✅ Found ${articles.length} matching articles`);
-    res.json({ canvas: buildResultsCanvas(query, articles) });
-  } catch (err) {
-    console.error('❌ KokoBrain search error:', err);
-    res.json({ canvas: buildErrorCanvas() });
-  }
-});
-
-async function debugKokoBrainContent(query) {
-  try {
-    console.log('🔄 Fetching KokoBrain content for debugging...');
-    
-    const response = await fetch('https://kokobrain.lovable.app', {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; KoletBot/1.0)',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-    }
-
-    const html = await response.text();
-    console.log(`📄 Retrieved ${html.length} characters`);
-
-    // Debug: Log the HTML structure
-    console.log('🔍 DEBUGGING HTML STRUCTURE:');
-    console.log('📋 First 500 characters:', html.substring(0, 500));
-    
-    // Look for common content patterns
-    const headings = html.match(/<h[1-6][^>]*>.*?<\/h[1-6]>/gi) || [];
-    console.log(`📝 Found ${headings.length} headings:`, headings.slice(0, 3));
-    
-    const paragraphs = html.match(/<p[^>]*>.*?<\/p>/gi) || [];
-    console.log(`📄 Found ${paragraphs.length} paragraphs`);
-    
-    const divs = html.match(/<div[^>]*>.*?<\/div>/gi) || [];
-    console.log(`📦 Found ${divs.length} divs`);
-    
-    const articles = html.match(/<article[^>]*>.*?<\/article>/gi) || [];
-    console.log(`📰 Found ${articles.length} article tags`);
-    
-    // Try to extract any text content
-    const cleanText = html
-      .replace(/<script[^>]*>.*?<\/script>/gis, '')
-      .replace(/<style[^>]*>.*?<\/style>/gis, '')
-      .replace(/<[^>]*>/g, ' ')
-      .replace(/\s+/g, ' ')
-      .trim();
-    
-    console.log(`📝 Clean text length: ${cleanText.length}`);
-    console.log(`📋 First 200 chars of clean text: "${cleanText.substring(0, 200)}"`);
-    
-    // Create searchable articles from any content we can find
-    const q = query.toLowerCase();
-    const results = [];
-    
-    // If we have headings, create articles from them
-    if (headings.length > 0) {
-      console.log('📝 Creating articles from headings...');
-      headings.forEach((heading, index) => {
-        const title = heading.replace(/<[^>]*>/g, '').trim();
-        if (title.toLowerCase().includes(q)) {
-          results.push({
-            title: title,
-            description: `Content from KokoBrain: ${title}`,
-            url: 'https://kokobrain.lovable.app',
-            content: title
-          });
-          console.log(`✅ Added heading match: "${title}"`);
-        }
-      });
-    }
-    
-    // If we have clean text, search through it
-    if (cleanText.length > 100 && cleanText.toLowerCase().includes(q)) {
-      console.log('📝 Found query in general content');
-      
-      // Find the context around the query
-      const lowerText = cleanText.toLowerCase();
-      const queryIndex = lowerText.indexOf(q);
-      const start = Math.max(0, queryIndex - 100);
-      const end = Math.min(cleanText.length, queryIndex + 100);
-      const context = cleanText.substring(start, end);
-      
-      results.push({
-        title: `KokoBrain Content (contains "${query}")`,
-        description: `...${context}...`,
-        url: 'https://kokobrain.lovable.app',
-        content: context
-      });
-    }
-    
-    // If nothing found, create a general result to show the system is working
-    if (results.length === 0) {
-      console.log('📝 No matches found, creating debug result');
-      results.push({
-        title: 'KokoBrain Debug Info',
-        description: `Searched ${cleanText.length} characters for "${query}". Found ${headings.length} headings, ${paragraphs.length} paragraphs.`,
-        url: 'https://kokobrain.lovable.app',
-        content: cleanText.substring(0, 200)
-      });
-    }
-    
-    console.log(`🎯 Returning ${results.length} debug results`);
-    return results;
-    
-  } catch (error) {
-    console.error('❌ Debug fetch failed:', error);
-    return [{
-      title: 'KokoBrain Connection Issue',
-      description: `Could not fetch content: ${error.message}`,
-      url: 'https://kokobrain.lovable.app',
-      content: 'Debug mode - connection failed'
-    }];
-  }
-}
-
 function buildResultsCanvas(query, articles) {
   const components = [
-    { type: "text", text: `🧠 Debug Results for "${query}"`, style: "header" },
+    { type: "text", text: `🧠 Results for "${query}"`, style: "header" },
     { type: "divider" }
   ];
 
-  for (const article of articles) {
-    components.push({ 
-      type: "text", 
-      text: `📄 ${article.title}`, 
-      style: "paragraph" 
+  if (articles.length === 0) {
+    components.push({
+      type: "text",
+      text: "No articles found. Try different keywords.",
+      style: "muted"
     });
-    components.push({ 
-      type: "text", 
-      text: article.description, 
-      style: "muted" 
-    });
-    components.push({ 
-      type: "anchor", 
-      href: article.url, 
-      text: "Open KokoBrain →" 
-    });
-    components.push({ type: "spacer", size: "s" });
+  } else {
+    for (const article of articles) {
+      if (article.category) {
+        components.push({ type: "text", text: article.category, style: "muted" });
+      }
+      components.push({ type: "text", text: `📄 ${article.title}`, style: "paragraph" });
+      components.push({ type: "anchor", href: article.url, text: "Open in Notion →" });
+      components.push({ type: "spacer", size: "s" });
+    }
   }
 
   components.push({ type: "divider" });
@@ -215,7 +156,7 @@ function buildErrorCanvas() {
   return {
     content: {
       components: [
-        { type: "text", text: "⚠️ Search temporarily unavailable. Please try again.", style: "muted" },
+        { type: "text", text: "⚠️ Could not reach Notion. Please try again.", style: "muted" },
         {
           type: "button",
           id: "back_btn",
@@ -228,4 +169,36 @@ function buildErrorCanvas() {
   };
 }
 
-app.listen(process.env.PORT || 3000, () => console.log('✅ KokoBrain debug search app running'));
+// --- Routes ---
+app.post('/intercom/initialize', (req, res) => {
+  res.json(searchUI);
+});
+
+app.get('/intercom/initialize', (req, res) => {
+  res.json(searchUI);
+});
+
+app.post('/intercom/submit', async (req, res) => {
+  const query = req.body.input_values?.search_query;
+
+  if (req.body.component_id === 'back_btn' || !query) {
+    return res.json(searchUI);
+  }
+
+  console.log(`🔍 Searching KokoBrain for: "${query}"`);
+
+  try {
+    const articles = await getArticles();
+    const results = searchArticles(articles, query);
+    console.log(`✅ Found ${results.length} matching articles`);
+    res.json({ canvas: buildResultsCanvas(query, results) });
+  } catch (err) {
+    console.error('Search error:', err.message);
+    res.json({ canvas: buildErrorCanvas() });
+  }
+});
+
+// Warm the cache on startup
+getArticles().catch(err => console.error('Cache warm failed:', err.message));
+
+app.listen(process.env.PORT || 3000, () => console.log('✅ KokoBrain app running'));
