@@ -183,6 +183,7 @@ const DOMAIN_TERMS = new Set([
   // eSIM core
   'esim','sim','apn','iccid','qr','qrcode','oneclick','profile','carrier',
   'imei','sos','greyed','grayed','sparks','lanck','plus','tim','proximus',
+  'pin','puk','pin code','puk code','blocked esim','unlock esim','sim locked',
   'installed','detected','uninstall','reinstall','reactivate','disable','enabled','disabled',
   // Connectivity
   'roaming','network','connection','connectivity','coverage','bandwidth','speed','throttle','throttled','signal',
@@ -388,6 +389,12 @@ const SYNONYMS = {
                  'fraudster','stolen','compromised','hacked','hijacked'],
   fraud:        ['scam','suspicious','blocked','fake','disposable',
                  'fraudster','stolen','compromised','unauthorized','fraudulent'],
+
+  // ── PIN / PUK — eSIM locked by PIN or PUK code ───────────────────────────
+  pin:          ['puk','pin code','puk code','pin number','blocked esim','esim blocked',
+                 'unlock esim','sim locked','activate sim','pin prompt',
+                 '1234','0000','wrong pin','enter pin','pin required','puk required',
+                 'esim pin','sim pin','locked sim','unlock sim'],
 };
 
 // Regex-based intent detection — more robust than keyword expansion for short/noisy text.
@@ -481,6 +488,10 @@ function detectIntents(text) {
   if (/\bsms\b|\bmms\b|text.{0,5}message|whatsapp|imessage|send.{0,8}(sms|text|message)|receiv.{0,8}(sms|text|message)|phone.{0,8}number/.test(q))
     intents.add('sms');
 
+  // ── PIN / PUK — eSIM locked by PIN or PUK code ───────────────────────────
+  if (/\bpin\b|\bpuk\b|pin.{0,5}(code|number|prompt)|puk.{0,5}(code|number)|blocked.{0,10}(pin|esim|sim)|esim.{0,10}blocked|unlock.{0,10}(esim|sim)|sim.{0,10}lock|enter.{0,10}pin|wrong.{0,10}pin/.test(q))
+    intents.add('pin_puk');
+
   return intents;
 }
 
@@ -508,11 +519,17 @@ const TAG_INTENT_MAP = [
   [/fraud|ban|suspend|block/i,                      'fraud'],
   [/imei|egypt|turkey|government/i,                 'government'],
   [/sms|verification|otp.?not|code.?not/i,          'sms'],
+  [/pin|puk|blocked.?esim|unlock.?esim|sim.?lock/i, 'pin_puk'],
 ];
 
 // Declarative table: [intent, articleFilterFn, injectScore]
 // Used by applyContextBoosts to force-inject relevant articles for each detected intent.
 const INTENT_INJECT_MAP = [
+  ['pin_puk',       a => {
+    const t = a.title.toLowerCase();
+    return t.includes('pin') || t.includes('puk') ||
+           (t.includes('blocked') && (t.includes('esim') || t.includes('sim')));
+  }, 330],
   ['locate',        a => {
     const t = a.title.toLowerCase();
     return t.includes('find') || t.includes('locat') || t.includes('cannot find') || t.includes('cannot see');
@@ -770,15 +787,21 @@ function searchArticles(articles, rawQuery) {
       }
     }
 
-    // ── Min-should-match (30% of raw terms must appear directly) ─────────
-    // Prevents articles that only match via distant synonym expansion from
-    // ranking above articles that genuinely address the query.
-    if (rawWords.length >= 2) {
-      const directHits = rawWords.filter(w =>
+    // ── Min-should-match (RAGFlow: 0.30) ─────────────────────────────────
+    // Applied to the top-10 most IDF-discriminative raw terms only.
+    // If we used ALL rawWords, long conversation texts (40+ tokens from bot
+    // messages) would require ~12 words to appear in a single article, making
+    // it impossible for any article to pass. Capping at 10 keeps the check
+    // meaningful for both 2-word manual queries and full conversation threads.
+    const checkTerms = rawWords.length > 10
+      ? [...rawWords].sort((a, b) => (idf[b] || 1) - (idf[a] || 1)).slice(0, 10)
+      : rawWords;
+    if (checkTerms.length >= 2) {
+      const directHits = checkTerms.filter(w =>
         title.includes(w) || category.includes(w) ||
         keywords.includes(w) || extkw.includes(w) || content.includes(w)
       ).length;
-      if (directHits / rawWords.length < 0.30) return { ...article, score: 0 };
+      if (directHits / checkTerms.length < 0.30) return { ...article, score: 0 };
     }
 
     return { ...article, score };
@@ -1130,9 +1153,11 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
   }
 
   // ── Step 2: intent detection (regex + Intercom tags + inbox name) ─────────
+  // signalText uses fullText (all messages incl. bot) for intent detection so
+  // the AI agent's reply title (e.g. "PIN/PUK Code") is also a signal.
   const tagText    = (convCtx?.tags  || []).join(' ');
   const inboxName  = (convCtx?.inboxName || '').toLowerCase();
-  const signalText = [convCtx?.text || '', inboxName, tagText].join(' ');
+  const signalText = [convCtx?.fullText || convCtx?.text || '', inboxName, tagText].join(' ');
   const intents    = detectIntents(signalText);
 
   // Intercom workflow tags are high-confidence signals — apply TAG_INTENT_MAP
@@ -1147,8 +1172,10 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
 
   const combined = [...scored, ...injected];
 
-  // ── Step 4: eSIM-state fallback (never return empty when we know the status) ──
-  if (combined.length === 0 && ctx.esimStatus) {
+  // ── Step 4: eSIM-state fallback (never return empty for eSIM-related convos) ──
+  // Fires when: no results yet AND (we have an eSIM status OR we have conversation text).
+  // Leads (no custom_attributes) have empty esimStatus but still have conversation text.
+  if (combined.length === 0 && (ctx.esimStatus || convCtx?.text)) {
     if (esimInstalled) {
       inject(allArticles, a => {
         const cat = a.category.toLowerCase();
@@ -1254,20 +1281,54 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
     .slice(0, 5);
 }
 
-// Extract ALL conversation text + structural signals (inbox, tags, topic)
+// Extract conversation text + structural signals (inbox, tags, topic).
+//
+// Returns TWO text fields so each layer of the engine uses the right signal:
+//   text     — customer messages only (user/lead authors). Used for the search
+//              query so bot workflow triggers and AI replies don't pollute it.
+//   fullText — every message including bot/admin. Used for intent detection so
+//              we also catch signals from the AI agent's reply titles.
 function extractConversationContext(body) {
   const conv = body.conversation || {};
 
-  // Collect every text chunk in the thread
-  const textParts = [
+  // ── Customer-only text (search query) ──────────────────────────────────
+  // Source: include if the author is not a bot (workflow triggers like
+  // "🤖 Talk to Kokobot" come from the user's action but contain bot text;
+  // we include the source subject (email subject) but skip pure bot bodies).
+  const userParts = [];
+  if (conv.source?.subject) userParts.push(conv.source.subject);
+  if (conv.source?.body && conv.source?.author?.type !== 'bot') {
+    userParts.push(conv.source.body);
+  }
+
+  // Conversation parts: only messages authored by the customer
+  const CUSTOMER_PART_TYPES = new Set(['comment', 'open']); // 'open' = reopen
+  for (const part of (conv.conversation_parts?.conversation_parts || [])) {
+    const atype = part.author?.type;
+    if (part.body && (atype === 'user' || atype === 'lead') &&
+        CUSTOMER_PART_TYPES.has(part.part_type)) {
+      userParts.push(part.body);
+    }
+  }
+  const text = userParts
+    .filter(Boolean)
+    .join(' ')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // ── Full thread text (intent detection) ────────────────────────────────
+  // Includes bot replies — useful because the AI agent's reply title often
+  // names the exact article category (e.g. "PIN/PUK Code").
+  const allParts = [
     conv.source?.subject,
     conv.source?.body,
     conv.first_contact_reply?.body,
   ];
   for (const part of (conv.conversation_parts?.conversation_parts || [])) {
-    if (part.body) textParts.push(part.body);
+    if (part.body) allParts.push(part.body);
   }
-  const text = textParts
+  const fullText = allParts
     .filter(Boolean)
     .join(' ')
     .replace(/<[^>]*>/g, ' ')
@@ -1289,7 +1350,7 @@ function extractConversationContext(body) {
   // Conversation topic if set
   const topic = (conv.conversation_topic?.name || '').toLowerCase().trim();
 
-  return { text, inboxName, tags, topic };
+  return { text, fullText, inboxName, tags, topic };
 }
 
 // Build augmented search query: thread text + inbox name + topic (no tags)
