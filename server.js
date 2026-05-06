@@ -1468,10 +1468,13 @@ function buildSuggestionsCanvas(articles, convCtx, ctx) {
   return {
     canvas: {
       stored_data: {
-        conv_query: convCtx ? buildConvSearchQuery(convCtx).slice(0, 400) : '',
-        ctx: ctx || null,
-        // Store display fields directly — back button uses these, no URL lookup needed
-        suggestion_articles: articles.map(a => ({ title: a.title, url: a.url, category: a.category })),
+        conv_query:  convCtx ? buildConvSearchQuery(convCtx).slice(0, 400) : '',
+        ctx:         ctx || null,
+        // Keep inbox_name and tags so back-button intent detection works correctly.
+        // We re-run the suggestion engine on back rather than caching articles,
+        // avoiding stored_data size limits.
+        inbox_name: convCtx?.inboxName || '',
+        tags:        convCtx?.tags     || [],
       },
       content: { components },
     },
@@ -1491,13 +1494,14 @@ const searchOnlyCanvas = {
   }
 };
 
-function buildResultsCanvas(headerText, articles, convQuery, ctx, suggestionArticles = []) {
+function buildResultsCanvas(headerText, articles, convQuery, ctx, storedConvCtxMeta = {}) {
+  const hasSuggestions = Boolean(convQuery);
   const components = [
     ...searchInputComponents(),
     {
       type:   'button',
       id:     'back_btn',
-      label:  convQuery ? '← Back to suggestions' : '← Clear results',
+      label:  hasSuggestions ? '← Back to suggestions' : '← Clear results',
       style:  'secondary',
       action: { type: 'submit' },
     },
@@ -1513,7 +1517,13 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx, suggestionArti
 
   return {
     canvas: {
-      stored_data: { conv_query: convQuery || '', ctx: ctx || null, suggestion_articles: suggestionArticles },
+      // Pass through conv context so back button can re-run the suggestion engine.
+      stored_data: {
+        conv_query: convQuery || '',
+        ctx:        ctx || null,
+        inbox_name: storedConvCtxMeta.inbox_name || '',
+        tags:       storedConvCtxMeta.tags        || [],
+      },
       content: { components },
     },
   };
@@ -1573,22 +1583,35 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     lastSubmit = req.body;
     console.log('SUBMIT component_id:', req.body.component_id);
 
-    const componentId      = req.body.component_id || '';
-    const storedData       = req.body.canvas_data?.stored_data || {};
-    const storedConvQuery  = storedData.conv_query || '';
-    const storedCtx        = storedData.ctx || null;
-    const storedSuggArticles = storedData.suggestion_articles || [];
+    const componentId     = req.body.component_id || '';
+    const storedData      = req.body.canvas_data?.stored_data || {};
+    const storedConvQuery = storedData.conv_query  || '';
+    const storedCtx       = storedData.ctx         || null;
+    const storedMeta      = { inbox_name: storedData.inbox_name || '', tags: storedData.tags || [] };
 
     // URL buttons open Notion directly — no state change needed
     if (componentId.startsWith('open_')) {
       return res.status(200).end();
     }
 
-    // Back to suggestions — uses stored article data, no DB lookup needed
+    // Back to suggestions — re-run the suggestion engine from stored conv context
+    // so we're never dependent on cached article data in stored_data.
     if (componentId === 'back_btn') {
-      if (storedSuggArticles.length > 0) {
-        const backConvCtx = { text: storedConvQuery, inboxName: '', tags: [], topic: '' };
-        return res.json(buildSuggestionsCanvas(storedSuggArticles, backConvCtx, storedCtx));
+      if (storedConvQuery) {
+        const backConvCtx = {
+          text:      storedConvQuery,
+          fullText:  storedConvQuery,
+          inboxName: storedMeta.inbox_name,
+          tags:      storedMeta.tags,
+          topic:     '',
+        };
+        const articles    = await getArticles();
+        const rawResults  = searchArticles(articles, storedConvQuery);
+        const suggestions = applyContextBoosts(articles, rawResults, storedCtx, backConvCtx);
+        if (suggestions.length > 0) {
+          console.log(`Back: restored ${suggestions.length} suggestions`);
+          return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx));
+        }
       }
       return res.json(searchOnlyCanvas);
     }
@@ -1597,13 +1620,26 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     const query    = sanitizeQuery(rawQuery);
     console.log(`Search: "${rawQuery}" -> "${query}"`);
 
-    if (!query) return res.json(searchOnlyCanvas);
+    if (!query) {
+      // Empty search — go back to suggestions if we have context, otherwise search-only
+      if (storedConvQuery) {
+        const backConvCtx = {
+          text: storedConvQuery, fullText: storedConvQuery,
+          inboxName: storedMeta.inbox_name, tags: storedMeta.tags, topic: '',
+        };
+        const articles    = await getArticles();
+        const rawResults  = searchArticles(articles, storedConvQuery);
+        const suggestions = applyContextBoosts(articles, rawResults, storedCtx, backConvCtx);
+        if (suggestions.length > 0) return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx));
+      }
+      return res.json(searchOnlyCanvas);
+    }
 
     const articles   = await getArticles();
     const rawResults = searchArticles(articles, query);
     const results    = applyContextBoosts(articles, rawResults, storedCtx);
     console.log(`Found ${results.length} for "${query}"`);
-    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery || null, storedCtx, storedSuggArticles));
+    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery || null, storedCtx, storedMeta));
 
   } catch (err) {
     lastError = { route: 'submit', message: err.message, stack: err.stack, time: new Date().toISOString() };
