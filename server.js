@@ -1495,7 +1495,9 @@ const searchOnlyCanvas = {
 };
 
 function buildResultsCanvas(headerText, articles, convQuery, ctx, storedConvCtxMeta = {}) {
-  const hasSuggestions = Boolean(convQuery);
+  // Show "Back to suggestions" whenever there's any stored context that could
+  // restore suggestions — conv_query may be empty for contact-attribute-only suggestions.
+  const hasSuggestions = Boolean(convQuery) || Boolean(ctx);
   const components = [
     ...searchInputComponents(),
     {
@@ -1596,8 +1598,10 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
 
     // Back to suggestions — re-run the suggestion engine from stored conv context
     // so we're never dependent on cached article data in stored_data.
+    // storedConvQuery may be empty when suggestions came purely from contact
+    // attributes (partnerKeyword, eSIM state, etc.) — gate on storedCtx too.
     if (componentId === 'back_btn') {
-      if (storedConvQuery) {
+      if (storedCtx || storedConvQuery) {
         const backConvCtx = {
           text:      storedConvQuery,
           fullText:  storedConvQuery,
@@ -1606,7 +1610,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
           topic:     '',
         };
         const articles    = await getArticles();
-        const rawResults  = searchArticles(articles, storedConvQuery);
+        const rawResults  = storedConvQuery ? searchArticles(articles, storedConvQuery) : [];
         const suggestions = applyContextBoosts(articles, rawResults, storedCtx, backConvCtx);
         if (suggestions.length > 0) {
           console.log(`Back: restored ${suggestions.length} suggestions`);
@@ -1622,13 +1626,13 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
 
     if (!query) {
       // Empty search — go back to suggestions if we have context, otherwise search-only
-      if (storedConvQuery) {
+      if (storedCtx || storedConvQuery) {
         const backConvCtx = {
           text: storedConvQuery, fullText: storedConvQuery,
           inboxName: storedMeta.inbox_name, tags: storedMeta.tags, topic: '',
         };
         const articles    = await getArticles();
-        const rawResults  = searchArticles(articles, storedConvQuery);
+        const rawResults  = storedConvQuery ? searchArticles(articles, storedConvQuery) : [];
         const suggestions = applyContextBoosts(articles, rawResults, storedCtx, backConvCtx);
         if (suggestions.length > 0) return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx));
       }
