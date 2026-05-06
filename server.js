@@ -1,18 +1,66 @@
 const express = require('express');
+const crypto  = require('crypto');
 const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
 require('dotenv').config();
 
 const app = express();
-app.use(express.json());
+// Capture raw body for Intercom signature verification; cap at 512 KB
+app.use(express.json({
+  limit: '512kb',
+  verify: (req, _res, buf) => { req.rawBody = buf; },
+}));
 
-// --- Debug: store last request bodies ---
-let lastInit = {};
+// --- Security middleware ---
+
+// Verify that POST requests come from Intercom (Canvas Kit x-body-signature).
+// Set INTERCOM_CLIENT_SECRET in env. If the var is absent the check is skipped
+// (allows local dev without the secret), but in production it MUST be set.
+function verifyIntercomRequest(req, res, next) {
+  const secret = process.env.INTERCOM_CLIENT_SECRET;
+  if (!secret) return next(); // dev mode — no secret configured
+
+  const header = req.headers['x-body-signature'] || '';
+  const digest = 'sha256=' + crypto
+    .createHmac('sha256', secret)
+    .update(req.rawBody || '')
+    .digest('hex');
+
+  let valid = false;
+  try {
+    // timingSafeEqual requires equal-length buffers
+    const a = Buffer.from(header);
+    const b = Buffer.from(digest);
+    valid = a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch { /* length mismatch → not equal */ }
+
+  if (!valid) {
+    console.warn('Rejected request: invalid Intercom signature');
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  next();
+}
+
+// Protect debug endpoints — require ?token=<DEBUG_TOKEN> or X-Debug-Token header.
+// If DEBUG_TOKEN env var is not set, debug endpoints return 403 (disabled in prod).
+function requireDebugToken(req, res, next) {
+  const token    = req.query.token || req.headers['x-debug-token'];
+  const expected = process.env.DEBUG_TOKEN;
+  if (!expected || token !== expected) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+  next();
+}
+
+// --- Debug: store last request / error state ---
+let lastInit   = {};
 let lastSubmit = {};
+let lastError  = {};
 
 // --- Notion cache ---
-let articleCache = null;
-let cacheExpiry = 0;
-const CACHE_TTL = 5 * 60 * 1000;
+let articleCache   = null;
+let cacheExpiry    = 0;
+let cacheInflight  = null; // deduplicates concurrent fetches
+const CACHE_TTL    = 5 * 60 * 1000;
 
 // Recursively fetch all block text up to MAX_DEPTH levels (handles toggles, callouts, lists, tables)
 const MAX_BLOCK_DEPTH = 3;
@@ -71,7 +119,14 @@ async function fetchBlocksText(blockId, depth = 0) {
 
 async function getArticles() {
   if (articleCache && Date.now() < cacheExpiry) return articleCache;
+  // If a fetch is already in progress, wait for it rather than launching a second one
+  if (cacheInflight) return cacheInflight;
 
+  cacheInflight = _fetchArticles().finally(() => { cacheInflight = null; });
+  return cacheInflight;
+}
+
+async function _fetchArticles() {
   const results = [];
   let cursor = undefined;
 
@@ -125,31 +180,48 @@ async function getArticles() {
 
 // Domain terms we always want to catch even if they appear only once
 const DOMAIN_TERMS = new Set([
-  'esim','sim','apn','iccid','qr','roaming','refund','invoice','wallet',
-  'koin','koins','fraud','install','activate','activation','connectivity',
-  'compatible','compatibility','profile','carrier','network','plan','bundle',
-  'expire','transfer','reassign','reassignment','migrate','migration','voucher','referral',
-  'promo','miles','loyalty','partner','otp','verification','password',
-  'login','account','billing','payment','credit','balance','topup','adapter',
+  // eSIM core
+  'esim','sim','apn','iccid','qr','qrcode','oneclick','profile','carrier',
+  'imei','sos','greyed','grayed','sparks','lanck','plus','tim','proximus',
+  'installed','detected','uninstall','reinstall','reactivate','disable','enabled','disabled',
+  // Connectivity
+  'roaming','network','connection','connectivity','coverage','bandwidth','speed','throttle','throttled','signal',
+  'restricted','blocked','government','vpn','zone','country','constraint','constraints','egypt','turkey','china',
+  // Plans & data
+  'plan','bundle','gb','extend','renewal','expire','topup','adapter',
+  'locate','find esim','locate esim','secondary','destination',
+  // Billing
+  'refund','invoice','wallet','koin','koins','billing','payment','credit','balance','reimbursement','cashback',
+  // Account
+  'login','account','otp','verification','password','subscription','domain','disposable',
+  'relay','privaterelay','nperf','consent','terms','conditions','checkbox',
+  // Transfers
+  'transfer','reassign','reassignment','migrate','migration','defective',
+  // Vouchers / loyalty
+  'voucher','referral','promo','miles','loyalty','partner','valid','validity','countdown','gift','donation',
+  // Devices
+  'compatible','compatibility','install','activate','activation',
   'android','iphone','pixel','samsung','huawei','xiaomi','oppo',
-  'restricted','blocked','government','vpn','zone','country','constraint','constraints','egypt','turkey',
-  'china','flying','blue','afklm','airfrance','klm','oneclick','qrcode',
-  'reimbursement','cashback','uninstall','reinstall','reactivate','disable',
-  'enabled','disabled','installed','detected','coverage','bandwidth','speed',
-  'throttle','expire','renewal','extend','top','topup','b2b','enterprise',
-  // eSIM types & labels users actually see on their device
-  'sparks','lanck','valid','plus','tim','proximus',
-  // eSIM/device troubleshooting terms
-  'imei','sos','greyed','grayed','defective','reassign','subscription',
-  'nperf','relay','privaterelay','domain','disposable',
-  // New from conversation analysis
-  'locate','locate esim','find esim','secondary','countdown','validity','consent',
-  'gift','donation','convert','unused','koins','koin','remaining','leftover',
-  'terms','conditions','checkbox','bezahlen','paiement','pagare','throttled',
-  'primary','data sim','primary sim','service','signal','destination',
-  // VoIP / calls feature
+  // Misc
+  'fraud','b2b','enterprise','convert','unused','remaining','leftover',
+  'flying','blue','afklm','airfrance','klm',
+  'primary','data sim','primary sim','service','bezahlen','paiement','pagare',
+  // VoIP / calls
   'voip','call','calling','appel','appels','appeler','microphone','micro',
   'minutes','ring','speaker','calls tab','international call',
+]);
+
+// Words to ignore when scoring
+const STOPWORDS = new Set([
+  'i','my','me','we','us','you','he','she','they','it','its',
+  'the','a','an','and','or','but','if','in','on','at','to','for',
+  'of','with','by','from','as','is','are','was','were','be','been',
+  'being','have','has','had','do','does','did','will','would','could',
+  'should','may','might','not','no','so','than','too','very','just',
+  'this','that','these','those','what','which','who','how','when',
+  'where','why','get','got','can','also','please','help','hi','hello',
+  'need','want','still','already','now','then','about','more','some',
+  'am','im','ive','dont','cant','wont','isnt','arent','wasnt',
 ]);
 
 function extractKeywordsFromContent(content) {
@@ -180,7 +252,7 @@ async function enrichArticleContent(articles) {
     await Promise.all(
       batch.map(async (article) => {
         if (!article.content) {
-          article.content          = await fetchBlocksText(article.pageId);
+          article.content           = await fetchBlocksText(article.pageId);
           article.extractedKeywords = extractKeywordsFromContent(article.content);
         }
       })
@@ -193,19 +265,6 @@ async function enrichArticleContent(articles) {
   }
   console.log('Knowledge base build complete');
 }
-
-// Words to ignore when scoring
-const STOPWORDS = new Set([
-  'i','my','me','we','us','you','he','she','they','it','its',
-  'the','a','an','and','or','but','if','in','on','at','to','for',
-  'of','with','by','from','as','is','are','was','were','be','been',
-  'being','have','has','had','do','does','did','will','would','could',
-  'should','may','might','not','no','so','than','too','very','just',
-  'this','that','these','those','what','which','who','how','when',
-  'where','why','get','got','can','also','please','help','hi','hello',
-  'need','want','still','already','now','then','about','more','some',
-  'am','im','ive','dont','cant','wont','isnt','arent','wasnt',
-]);
 
 // Customer language → article terms. Each key maps to terms likely in article titles/categories.
 // Updated from real Intercom conversation analysis (May 2026).
@@ -226,7 +285,7 @@ const SYNONYMS = {
   // ── eSIM install / setup ─────────────────────────────────────────────────
   install:      ['installation','setup','set up','activate','activation','qr','scan','add esim',
                  'how to install','cant install','cannot install','not installing'],
-  // NEW — "find / locate eSIM in phone settings" (different from install problems)
+  // "find / locate eSIM in phone settings" (distinct from install problems)
   locate:       ['find my esim','cant find','cannot find','not showing','not visible','not appearing',
                  'disappeared','where is my esim','see my esim','show esim','secondary sim',
                  'business line','travel sim','mobile data label','which sim is kolet',
@@ -259,17 +318,15 @@ const SYNONYMS = {
   // ── Transfer / device change ─────────────────────────────────────────────
   transfer:     ['move','switch','reassign','new phone','new device','change device','migrate','migration',
                  'defective','broken','repair','replaced phone','phone broken','faulty','factory reset'],
-  // NEW — data gifting / donation (distinct from device transfer)
+  // data gifting / donation (distinct from device transfer)
   gift:         ['gift data','gifted','gift my gb','data donation','donate data','wrong email',
                  'recipient','receiver','reciever','regalo','cadeau','gifted to wrong','sent to wrong'],
 
   // ── Koins / convert unused data ──────────────────────────────────────────
-  // NEW — Koins are frequently asked about but were missing from SYNONYMS entirely
   koins:        ['koin','kolet koins','remaining credit','in-app credit','wallet credit',
                  'crédit restant','utiliser le crédit','use my credit','convert data',
                  'convert unused','unused data','données inutilisées','reconvertir',
                  'how do i use koins','use koins'],
-  // NEW — explicit "convert" intent
   convert:      ['convert unused','convert data','convert to koins','unused data',
                  'données inutilisées','reconvertir','remaining data','leftover data'],
 
@@ -427,6 +484,126 @@ function detectIntents(text) {
   return intents;
 }
 
+// Maps Intercom workflow tag text / inbox name patterns → intent labels.
+// Checked in addition to regex-based detectIntents() — tags are high-confidence signals.
+const TAG_INTENT_MAP = [
+  [/locat|find.{0,10}esim|request.*locat/i,        'locate'],
+  [/connect|start.?using|no.?internet|no.?data|few.?kb/i, 'connection'],
+  [/slow|throttl/i,                                 'slow'],
+  [/install|setup|qr/i,                             'install'],
+  [/extend|renew|top.?up|more.?data/i,              'extend'],
+  [/expir|ran.?out|no.?more.?data/i,                'expired'],
+  [/refund|cashback|reimburs/i,                     'refund'],
+  [/invoice|receipt|billing|payment/i,              'invoice'],
+  [/transfer|reassign|new.?device/i,                'transfer'],
+  [/login|sign.?in|otp|password|access/i,           'account'],
+  [/delete.?account|unsubscribe/i,                  'delete_account'],
+  [/change.?email|email.?address/i,                 'change_email'],
+  [/koin|wallet|convert|unused.?data/i,             'koins'],
+  [/voucher|promo|referral|discount/i,              'voucher'],
+  [/gift|donat|share.?data/i,                       'gift'],
+  [/adapter|compat/i,                               'compatibility'],
+  [/voip|call/i,                                    'voip'],
+  [/flying.?blue|miles|afklm|air.?france/i,         'miles'],
+  [/fraud|ban|suspend|block/i,                      'fraud'],
+  [/imei|egypt|turkey|government/i,                 'government'],
+  [/sms|verification|otp.?not|code.?not/i,          'sms'],
+];
+
+// Declarative table: [intent, articleFilterFn, injectScore]
+// Used by applyContextBoosts to force-inject relevant articles for each detected intent.
+const INTENT_INJECT_MAP = [
+  ['locate',        a => {
+    const t = a.title.toLowerCase();
+    return t.includes('find') || t.includes('locat') || t.includes('cannot find') || t.includes('cannot see');
+  }, 320],
+  ['connection',    a => {
+    const cat = a.category.toLowerCase();
+    const t   = a.title.toLowerCase();
+    return cat.includes('connect') || cat.includes('start using') ||
+           t.includes('apn') || t.includes('no data') || t.includes('no internet') ||
+           t.includes('constraint') || t.includes('country');
+  }, 300],
+  ['slow',          a => {
+    const t = a.title.toLowerCase();
+    return t.includes('slow') || t.includes('constraint') || t.includes('country');
+  }, 300],
+  ['install',       a => a.category.toLowerCase().includes('install'), 290],
+  ['extend',        a => {
+    const t = a.title.toLowerCase();
+    return t.includes('extend') || t.includes('renew') || t.includes('top up') || t.includes('topup');
+  }, 290],
+  ['expired',       a => {
+    const t = a.title.toLowerCase();
+    return t.includes('extend') || t.includes('renew') || t.includes('expir');
+  }, 290],
+  ['refund',        a => {
+    const cat = a.category.toLowerCase();
+    const t   = a.title.toLowerCase();
+    return cat.includes('refund') || cat.includes('billing') ||
+           t.includes('refund') || t.includes('reimburse') || t.includes('cashback');
+  }, 290],
+  ['invoice',       a => {
+    const t = a.title.toLowerCase();
+    return t.includes('invoice') || t.includes('receipt') || t.includes('billing');
+  }, 290],
+  ['transfer',      a => {
+    const t = a.title.toLowerCase();
+    return t.includes('reassign') || t.includes('transfer') || t.includes('move') || t.includes('new device');
+  }, 290],
+  ['account',       a => {
+    const cat = a.category.toLowerCase();
+    const t   = a.title.toLowerCase();
+    return cat.includes('account') || cat.includes('login') ||
+           t.includes('login') || t.includes('otp') || t.includes('password');
+  }, 290],
+  ['delete_account', a => {
+    const t = a.title.toLowerCase();
+    return t.includes('delete') || t.includes('unsubscribe');
+  }, 290],
+  ['change_email',   a => {
+    const t = a.title.toLowerCase();
+    return t.includes('email') || t.includes('transferring account');
+  }, 280],
+  ['koins',         a => {
+    const t = a.title.toLowerCase();
+    return t.includes('koin') || t.includes('wallet') || t.includes('convert') || t.includes('unused');
+  }, 290],
+  ['voucher',       a => {
+    const t = a.title.toLowerCase();
+    return t.includes('voucher') || t.includes('promo') || t.includes('referral') || t.includes('discount');
+  }, 290],
+  ['gift',          a => {
+    const t = a.title.toLowerCase();
+    return t.includes('gift') || t.includes('donat') || t.includes('share data');
+  }, 290],
+  ['compatibility', a => {
+    const t = a.title.toLowerCase();
+    return t.includes('adapter') || t.includes('compatible') || t.includes('compatibility');
+  }, 280],
+  ['voip',          a => {
+    const t = a.title.toLowerCase();
+    return t.includes('voip') || t.includes('calling') || t.includes('call');
+  }, 310],
+  ['miles',         a => {
+    const t = a.title.toLowerCase();
+    return t.includes('flying blue') || t.includes('air france') || t.includes('afklm') || t.includes('miles');
+  }, 290],
+  ['fraud',         a => {
+    const cat = a.category.toLowerCase();
+    return cat.includes('fraud') || a.title.toLowerCase().includes('fraud');
+  }, 290],
+  ['government',    a => {
+    const t = a.title.toLowerCase();
+    return t.includes('egyptian') || t.includes('turkish') || t.includes('government') ||
+           t.includes('imei') || t.includes('constraint') || t.includes('country');
+  }, 300],
+  ['sms',           a => {
+    const t = a.title.toLowerCase();
+    return t.includes('sms') || t.includes('otp') || (t.includes('phone') && t.includes('number'));
+  }, 280],
+];
+
 function sanitizeQuery(raw) {
   if (!raw) return '';
   return raw.replace(/[^\w\s\-']/g, '').trim().toLowerCase();
@@ -463,20 +640,46 @@ function expandTerms(words, fullQuery) {
   return { terms: Array.from(expanded), boostConcepts: Array.from(conceptBoosts) };
 }
 
-function scoreText(text, terms, phrase) {
-  let score = 0;
-  if (phrase && text.includes(phrase)) score += 50;
-  for (const term of terms) {
-    if (text.includes(term)) score += term.includes(' ') ? 30 : 15; // phrases score more
+// ── RAGFlow-inspired scoring primitives ──────────────────────────────────────
+//
+// Field-boost table (mirrors RAGFlow's per-field ^N weights):
+//   title          → ×10  (most discriminative field)
+//   manual keywords → ×5  (like RAGFlow's important_kwd)
+//   category       → ×3
+//   extracted kws  → ×2
+//   body content   → ×1  (noisy; gets an extra 0.5× in the caller)
+//
+const FIELD_BOOSTS = { title: 10, category: 3, keywords: 5, extkw: 2, content: 1 };
+
+// Score a single (term, field) pair with IDF weighting.
+// Multi-word phrases score ×2 — they are more specific than unigrams.
+function scoreFieldIDF(text, term, idfWeight, fieldBoost) {
+  if (!text || !text.includes(term)) return 0;
+  return idfWeight * fieldBoost * (term.includes(' ') ? 2 : 1);
+}
+
+// Compute smoothed IDF for each raw query term against the article corpus.
+// Rare terms (appear in few articles) get higher weight → boost precision.
+// Formula: log10((N+1) / (df+1)) + 1   (smoothed, never reaches 0)
+function computeQueryIDF(articles, rawTerms) {
+  const N = Math.max(articles.length, 1);
+  const weights = {};
+  for (const term of rawTerms) {
+    let df = 0;
+    for (const a of articles) {
+      const hay = `${a.title} ${a.category} ${a.keywords} ${a.extractedKeywords}`.toLowerCase();
+      if (hay.includes(term)) df++;
+    }
+    weights[term] = Math.log10((N + 1) / (df + 1)) + 1;
   }
-  return score;
+  return weights;
 }
 
 function searchArticles(articles, rawQuery) {
   const q = sanitizeQuery(rawQuery);
   if (!q) return [];
 
-  // Split, remove stopwords, keep known short terms (gb, eu, uk, qr)
+  // Split into tokens; preserve short but meaningful abbreviations
   const KEEP_SHORT = new Set(['gb','eu','uk','qr','us','fr']);
   const rawWords = q.split(/\s+/).filter(w =>
     (w.length > 2 || KEEP_SHORT.has(w)) && !STOPWORDS.has(w)
@@ -485,15 +688,39 @@ function searchArticles(articles, rawQuery) {
 
   const { terms: expanded, boostConcepts } = expandTerms(rawWords, q);
 
+  // ── IDF weights: rare corpus terms get higher weight ─────────────────────
+  const idf = computeQueryIDF(articles, rawWords);
+
+  // ── Build weighted term list ──────────────────────────────────────────────
+  // Raw query terms use their IDF weight directly.
+  // Synonyms / expanded terms use 25% of their parent's IDF (RAGFlow: 0.25×).
+  const rawSet = new Set(rawWords);
+  const termWeights = [];
+  for (const term of expanded) {
+    if (rawSet.has(term)) {
+      termWeights.push({ term, weight: idf[term] || 1 });
+    } else {
+      // Find the parent raw word whose synonym list contains this term
+      let parentW = 0.5;
+      for (const rw of rawWords) {
+        if (SYNONYMS[rw]?.includes(term) || SYNONYMS[term]?.includes(rw)) {
+          parentW = idf[rw] || 1;
+          break;
+        }
+      }
+      termWeights.push({ term, weight: parentW * 0.25 });
+    }
+  }
+
   const scored = articles.map(article => {
     const title    = article.title.toLowerCase();
     const category = article.category.toLowerCase();
-    const keywords = article.keywords;                    // manual Notion keywords
-    const extkw    = article.extractedKeywords || '';     // auto-extracted knowledge base
+    const keywords = article.keywords;
+    const extkw    = article.extractedKeywords || '';
     const content  = article.content || '';
     let score = 0;
 
-    // Exact / phrase match on full query
+    // ── Exact / full-phrase match on raw query ────────────────────────────
     if (title === q)            score += 400;
     else if (title.includes(q)) score += 200;
     if (category.includes(q))   score += 80;
@@ -501,14 +728,29 @@ function searchArticles(articles, rawQuery) {
     if (extkw.includes(q))      score += 55;
     if (content.includes(q))    score += 40;
 
-    // Expanded term scoring across all fields
-    score += scoreText(title,    expanded, q) * 2;  // title weighted 2×
-    score += scoreText(category, expanded, q);
-    score += scoreText(keywords, expanded, q);
-    score += scoreText(extkw,    expanded, q);       // knowledge base on par with manual keywords
-    score += scoreText(content,  expanded, q) * 0.5; // raw content lower weight (noisy)
+    // ── IDF-weighted field scoring ────────────────────────────────────────
+    // Field-boost multipliers mirror RAGFlow's ^N weights per field.
+    // Content is capped at 0.5× to reduce noise from long page bodies.
+    for (const { term, weight } of termWeights) {
+      score += scoreFieldIDF(title,    term, weight, FIELD_BOOSTS.title);
+      score += scoreFieldIDF(category, term, weight, FIELD_BOOSTS.category);
+      score += scoreFieldIDF(keywords, term, weight, FIELD_BOOSTS.keywords);
+      score += scoreFieldIDF(extkw,    term, weight, FIELD_BOOSTS.extkw);
+      score += scoreFieldIDF(content,  term, weight, FIELD_BOOSTS.content) * 0.5;
+    }
 
-    // Concept boost: phrase match confirmed the intent → heavily reward title hits
+    // ── Bigram scoring ────────────────────────────────────────────────────
+    // RAGFlow: bigram_weight = max(w_left, w_right) × 0.6
+    // Adjacent token pairs are stronger intent signals than isolated unigrams.
+    for (let i = 0; i < rawWords.length - 1; i++) {
+      const bigram   = `${rawWords[i]} ${rawWords[i + 1]}`;
+      const bigramW  = Math.max(idf[rawWords[i]] || 1, idf[rawWords[i + 1]] || 1) * 0.6;
+      score += scoreFieldIDF(title,    bigram, bigramW, FIELD_BOOSTS.title);
+      score += scoreFieldIDF(keywords, bigram, bigramW, FIELD_BOOSTS.keywords);
+      score += scoreFieldIDF(content,  bigram, bigramW, FIELD_BOOSTS.content);
+    }
+
+    // ── Concept boost: phrase match confirmed the intent ──────────────────
     for (const concept of boostConcepts) {
       if (title.includes(concept))    score += 200;
       if (category.includes(concept)) score += 80;
@@ -516,18 +758,32 @@ function searchArticles(articles, rawQuery) {
       if (extkw.includes(concept))    score += 55;
     }
 
-    // Prefix match on individual title words
+    // ── IDF-weighted prefix match on title tokens ─────────────────────────
+    // Catches stemming gaps ("install" → "installation") with IDF awareness
     const titleTokens = title.split(/[\s:,\-&()]+/);
     for (const word of rawWords) {
+      const w = idf[word] || 1;
       for (const token of titleTokens) {
-        if (token && (token.startsWith(word) || word.startsWith(token))) score += 15;
+        if (token && token.length > 2 && (token.startsWith(word) || word.startsWith(token))) {
+          score += w * 3;
+        }
       }
+    }
+
+    // ── Min-should-match (30% of raw terms must appear directly) ─────────
+    // Prevents articles that only match via distant synonym expansion from
+    // ranking above articles that genuinely address the query.
+    if (rawWords.length >= 2) {
+      const directHits = rawWords.filter(w =>
+        title.includes(w) || category.includes(w) ||
+        keywords.includes(w) || extkw.includes(w) || content.includes(w)
+      ).length;
+      if (directHits / rawWords.length < 0.30) return { ...article, score: 0 };
     }
 
     return { ...article, score };
   });
 
-  // Return all scored articles — callers apply context boosts then slice
   return scored
     .filter(a => a.score > 0)
     .sort((a, b) => b.score - a.score);
@@ -565,6 +821,12 @@ const PARTNER_TITLE_MAP = {
 // Countries where eSIM is blocked / heavily restricted
 const RESTRICTED_COUNTRIES = new Set(['eg','egy','egypt','tr','tur','turkey','cn','china']);
 
+// Chinese-market device brands — often have eSIM installation quirks
+const CHINESE_BRANDS = new Set([
+  'oppo','huawei','xiaomi','oneplus','realme','vivo','honor','zte','meizu','lenovo',
+  'tcl','tecno','infinix','nothing',
+]);
+
 function extractContactContext(body) {
   const contact = body.contact || {};
   const attrs   = contact.custom_attributes || {};
@@ -587,8 +849,6 @@ function extractContactContext(body) {
   const planZone = (attrs.current_plan_zone_code || attrs.initial_gift_zone_code || '').toLowerCase();
   const isRestrictedCountry = RESTRICTED_COUNTRIES.has(planZone);
 
-  // Chinese-market device brands often have eSIM installation quirks
-  const CHINESE_BRANDS = new Set(['oppo','huawei','xiaomi','oneplus','realme','vivo','honor','zte','meizu','lenovo','tcl','tecno','infinix','nothing']);
   const deviceBrand = (attrs.device_brand || '').toLowerCase();
   const isChineseDevice = CHINESE_BRANDS.has(deviceBrand);
 
@@ -637,8 +897,9 @@ function getArticleHint(article, ctx) {
   const title    = article.title.toLowerCase();
   const category = article.category.toLowerCase();
 
-  const esimInstalled   = /installed|enabled|active/.test(ctx.esimStatus);
+  // Check uninstalled/not-installed FIRST, then installed — avoids "uninstalled".includes("installed")
   const esimUninstalled = /uninstalled|not_installed|deleted/.test(ctx.esimStatus);
+  const esimInstalled   = !esimUninstalled && /installed|enabled|active/.test(ctx.esimStatus);
   const esimDisabled    = /disabled/.test(ctx.esimStatus);
   const neverConnected  = esimInstalled && ctx.esimLastCountry === null;
 
@@ -819,8 +1080,9 @@ function getArticleHint(article, ctx) {
 function applyContextBoosts(allArticles, scored, ctx, convCtx) {
   if (!ctx) return scored.slice(0, 5);
 
-  const esimInstalled   = /installed|enabled|active/.test(ctx.esimStatus);
+  // Check uninstalled/not-installed FIRST, then installed — avoids "uninstalled".includes("installed")
   const esimUninstalled = /uninstalled|not_installed|deleted/.test(ctx.esimStatus);
+  const esimInstalled   = !esimUninstalled && /installed|enabled|active/.test(ctx.esimStatus);
   const esimDisabled    = /disabled/.test(ctx.esimStatus);
   const neverConnected  = esimInstalled && ctx.esimLastCountry === null;
 
@@ -868,133 +1130,17 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
   }
 
   // ── Step 2: intent detection (regex + Intercom tags + inbox name) ─────────
-  // Build a combined signal string from all available conversation context
-  const tagText   = (convCtx?.tags  || []).join(' ');
-  const inboxName = (convCtx?.inboxName || '').toLowerCase();
+  const tagText    = (convCtx?.tags  || []).join(' ');
+  const inboxName  = (convCtx?.inboxName || '').toLowerCase();
   const signalText = [convCtx?.text || '', inboxName, tagText].join(' ');
-  const intents = detectIntents(signalText);
+  const intents    = detectIntents(signalText);
 
-  // Intercom workflow tags are very high-confidence intent signals — map all known tag patterns
-  const TAG_INTENT_MAP = [
-    [/locat|find.{0,10}esim|request.*locat/i,        'locate'],
-    [/connect|start.?using|no.?internet|no.?data|few.?kb/i, 'connection'],
-    [/slow|throttl/i,                                 'slow'],
-    [/install|setup|qr/i,                             'install'],
-    [/extend|renew|top.?up|more.?data/i,              'extend'],
-    [/expir|ran.?out|no.?more.?data/i,                'expired'],
-    [/refund|cashback|reimburs/i,                     'refund'],
-    [/invoice|receipt|billing|payment/i,              'invoice'],
-    [/transfer|reassign|new.?device/i,                'transfer'],
-    [/login|sign.?in|otp|password|access/i,           'account'],
-    [/delete.?account|unsubscribe/i,                  'delete_account'],
-    [/change.?email|email.?address/i,                 'change_email'],
-    [/koin|wallet|convert|unused.?data/i,             'koins'],
-    [/voucher|promo|referral|discount/i,              'voucher'],
-    [/gift|donat|share.?data/i,                       'gift'],
-    [/adapter|compat/i,                               'compatibility'],
-    [/voip|call/i,                                    'voip'],
-    [/flying.?blue|miles|afklm|air.?france/i,         'miles'],
-    [/fraud|ban|suspend|block/i,                      'fraud'],
-    [/imei|egypt|turkey|government/i,                 'government'],
-    [/sms|verification|otp.?not|code.?not/i,          'sms'],
-  ];
+  // Intercom workflow tags are high-confidence signals — apply TAG_INTENT_MAP
   TAG_INTENT_MAP.forEach(([re, intent]) => {
     if (re.test(tagText) || re.test(inboxName)) intents.add(intent);
   });
 
   // ── Step 3: inject articles for each detected intent ─────────────────────
-  const INTENT_INJECT_MAP = [
-    ['locate',        a => {
-      const t = a.title.toLowerCase();
-      return t.includes('find') || t.includes('locat') || t.includes('cannot find') || t.includes('cannot see');
-    }, 320],
-    ['connection',    a => {
-      const cat = a.category.toLowerCase();
-      const t   = a.title.toLowerCase();
-      return cat.includes('connect') || cat.includes('start using') ||
-             t.includes('apn') || t.includes('no data') || t.includes('no internet') ||
-             t.includes('constraint') || t.includes('country');
-    }, 300],
-    ['slow',          a => {
-      const t = a.title.toLowerCase();
-      return t.includes('slow') || t.includes('constraint') || t.includes('country');
-    }, 300],
-    ['install',       a => a.category.toLowerCase().includes('install'), 290],
-    ['extend',        a => {
-      const t = a.title.toLowerCase();
-      return t.includes('extend') || t.includes('renew') || t.includes('top up') || t.includes('topup');
-    }, 290],
-    ['expired',       a => {
-      const t = a.title.toLowerCase();
-      return t.includes('extend') || t.includes('renew') || t.includes('expir');
-    }, 290],
-    ['refund',        a => {
-      const cat = a.category.toLowerCase();
-      const t   = a.title.toLowerCase();
-      return cat.includes('refund') || cat.includes('billing') ||
-             t.includes('refund') || t.includes('reimburse') || t.includes('cashback');
-    }, 290],
-    ['invoice',       a => {
-      const t = a.title.toLowerCase();
-      return t.includes('invoice') || t.includes('receipt') || t.includes('billing');
-    }, 290],
-    ['transfer',      a => {
-      const t = a.title.toLowerCase();
-      return t.includes('reassign') || t.includes('transfer') || t.includes('move') || t.includes('new device');
-    }, 290],
-    ['account',       a => {
-      const cat = a.category.toLowerCase();
-      const t   = a.title.toLowerCase();
-      return cat.includes('account') || cat.includes('login') ||
-             t.includes('login') || t.includes('otp') || t.includes('password');
-    }, 290],
-    ['delete_account', a => {
-      const t = a.title.toLowerCase();
-      return t.includes('delete') || t.includes('unsubscribe');
-    }, 290],
-    ['change_email',   a => {
-      const t = a.title.toLowerCase();
-      return t.includes('email') || t.includes('transferring account');
-    }, 280],
-    ['koins',         a => {
-      const t = a.title.toLowerCase();
-      return t.includes('koin') || t.includes('wallet') || t.includes('convert') || t.includes('unused');
-    }, 290],
-    ['voucher',       a => {
-      const t = a.title.toLowerCase();
-      return t.includes('voucher') || t.includes('promo') || t.includes('referral') || t.includes('discount');
-    }, 290],
-    ['gift',          a => {
-      const t = a.title.toLowerCase();
-      return t.includes('gift') || t.includes('donat') || t.includes('share data');
-    }, 290],
-    ['compatibility', a => {
-      const t = a.title.toLowerCase();
-      return t.includes('adapter') || t.includes('compatible') || t.includes('compatibility');
-    }, 280],
-    ['voip',          a => {
-      const t = a.title.toLowerCase();
-      return t.includes('voip') || t.includes('calling') || t.includes('call');
-    }, 310],
-    ['miles',         a => {
-      const t = a.title.toLowerCase();
-      return t.includes('flying blue') || t.includes('air france') || t.includes('afklm') || t.includes('miles');
-    }, 290],
-    ['fraud',         a => {
-      const cat = a.category.toLowerCase();
-      return cat.includes('fraud') || a.title.toLowerCase().includes('fraud');
-    }, 290],
-    ['government',    a => {
-      const t = a.title.toLowerCase();
-      return t.includes('egyptian') || t.includes('turkish') || t.includes('government') ||
-             t.includes('imei') || t.includes('constraint') || t.includes('country');
-    }, 300],
-    ['sms',           a => {
-      const t = a.title.toLowerCase();
-      return t.includes('sms') || t.includes('otp') || (t.includes('phone') && t.includes('number'));
-    }, 280],
-  ];
-
   for (const [intent, filterFn, score] of INTENT_INJECT_MAP) {
     if (intents.has(intent)) inject(allArticles, filterFn, score);
   }
@@ -1195,6 +1341,31 @@ function getArticleEmoji(article) {
 
 // --- Canvas builders ---
 
+// Shared article list renderer used by both suggestions and results canvases.
+// withEmoji = true → prepend category emoji to button label (suggestions view).
+function renderArticleComponents(articles, ctx, withEmoji = false) {
+  const components = [];
+  for (let i = 0; i < articles.length; i++) {
+    const article = articles[i];
+    const hint    = getArticleHint(article, ctx);
+    components.push({ type: 'divider' });
+    if (article.category) {
+      components.push({ type: 'text', text: article.category, style: 'muted' });
+    }
+    components.push({
+      type:   'button',
+      id:     `open_${i}`,
+      label:  withEmoji ? `${getArticleEmoji(article)} ${article.title}` : article.title,
+      style:  'link',
+      action: { type: 'url', url: article.url },
+    });
+    if (hint) {
+      components.push({ type: 'text', text: `⚡ ${hint}`, style: 'muted' });
+    }
+  }
+  return components;
+}
+
 function searchInputComponents() {
   return [
     {
@@ -1219,32 +1390,13 @@ function buildSuggestionsCanvas(articles, convCtx, ctx) {
 
   const components = [
     ...searchInputComponents(),
-    { type: "divider" },
-    { type: "text", text: "Suggested articles", style: "header" },
+    { type: 'divider' },
+    { type: 'text', text: 'Suggested articles', style: 'header' },
   ];
-
   if (contextLabel) {
-    components.push({ type: "text", text: contextLabel, style: "muted" });
+    components.push({ type: 'text', text: contextLabel, style: 'muted' });
   }
-
-  for (let i = 0; i < articles.length; i++) {
-    const article = articles[i];
-    const hint = getArticleHint(article, ctx);
-    components.push({ type: "divider" });
-    if (article.category) {
-      components.push({ type: "text", text: article.category, style: "muted" });
-    }
-    components.push({
-      type: "button",
-      id: `open_${i}`,
-      label: `${getArticleEmoji(article)} ${article.title}`,
-      style: "link",
-      action: { type: "url", url: article.url }
-    });
-    if (hint) {
-      components.push({ type: "text", text: `⚡ ${hint}`, style: "muted" });
-    }
-  }
+  components.push(...renderArticleComponents(articles, ctx, true));
 
   return {
     canvas: {
@@ -1254,8 +1406,8 @@ function buildSuggestionsCanvas(articles, convCtx, ctx) {
         // Store display fields directly — back button uses these, no URL lookup needed
         suggestion_articles: articles.map(a => ({ title: a.title, url: a.url, category: a.category })),
       },
-      content: { components }
-    }
+      content: { components },
+    },
   };
 }
 
@@ -1273,49 +1425,30 @@ const searchOnlyCanvas = {
 };
 
 function buildResultsCanvas(headerText, articles, convQuery, ctx, suggestionArticles = []) {
-  const backButton = {
-    type: "button",
-    id: "back_btn",
-    label: convQuery ? "← Back to suggestions" : "← Clear results",
-    style: "secondary",
-    action: { type: "submit" }
-  };
-
   const components = [
     ...searchInputComponents(),
-    backButton,
-    { type: "divider" },
-    { type: "text", text: headerText, style: "header" },
+    {
+      type:   'button',
+      id:     'back_btn',
+      label:  convQuery ? '← Back to suggestions' : '← Clear results',
+      style:  'secondary',
+      action: { type: 'submit' },
+    },
+    { type: 'divider' },
+    { type: 'text', text: headerText, style: 'header' },
   ];
 
   if (articles.length === 0) {
-    components.push({ type: "text", text: "No articles found.", style: "muted" });
+    components.push({ type: 'text', text: 'No articles found.', style: 'muted' });
   } else {
-    for (let i = 0; i < articles.length; i++) {
-      const article = articles[i];
-      const hint = getArticleHint(article, ctx);
-      components.push({ type: "divider" });
-      if (article.category) {
-        components.push({ type: "text", text: article.category, style: "muted" });
-      }
-      components.push({
-        type: "button",
-        id: `open_${i}`,
-        label: article.title,
-        style: "link",
-        action: { type: "url", url: article.url }
-      });
-      if (hint) {
-        components.push({ type: "text", text: `⚡ ${hint}`, style: "muted" });
-      }
-    }
+    components.push(...renderArticleComponents(articles, ctx, false));
   }
 
   return {
     canvas: {
       stored_data: { conv_query: convQuery || '', ctx: ctx || null, suggestion_articles: suggestionArticles },
-      content: { components }
-    }
+      content: { components },
+    },
   };
 }
 
@@ -1337,7 +1470,7 @@ function buildErrorCanvas(msg) {
 
 app.get('/intercom/initialize', (req, res) => res.json(searchOnlyCanvas));
 
-app.post('/intercom/initialize', async (req, res) => {
+app.post('/intercom/initialize', verifyIntercomRequest, async (req, res) => {
   try {
     lastInit = req.body;
 
@@ -1368,7 +1501,7 @@ app.post('/intercom/initialize', async (req, res) => {
   }
 });
 
-app.post('/intercom/submit', async (req, res) => {
+app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
   try {
     lastSubmit = req.body;
     console.log('SUBMIT component_id:', req.body.component_id);
@@ -1393,7 +1526,7 @@ app.post('/intercom/submit', async (req, res) => {
       return res.json(searchOnlyCanvas);
     }
 
-    const rawQuery = req.body.input_values?.search_query;
+    const rawQuery = String(req.body.input_values?.search_query || '').slice(0, 300);
     const query    = sanitizeQuery(rawQuery);
     console.log(`Search: "${rawQuery}" -> "${query}"`);
 
@@ -1418,18 +1551,17 @@ app.use((err, req, res, next) => {
   res.status(200).json(searchOnlyCanvas);
 });
 
-// Debug endpoints
-let lastError = {};
-app.get('/debug/last-init',   (req, res) => res.json(lastInit));
-app.get('/debug/last-error',  (req, res) => res.json(lastError));
-app.get('/debug/last-submit', (req, res) => res.json(lastSubmit));
-app.get('/debug/search', async (req, res) => {
-  const q = req.query.q || '';
+// Debug endpoints — protected by DEBUG_TOKEN env var
+app.get('/debug/last-init',   requireDebugToken, (req, res) => res.json(lastInit));
+app.get('/debug/last-error',  requireDebugToken, (req, res) => res.json(lastError));
+app.get('/debug/last-submit', requireDebugToken, (req, res) => res.json(lastSubmit));
+app.get('/debug/search', requireDebugToken, async (req, res) => {
+  const q = String(req.query.q || '').slice(0, 300);
   const articles = await getArticles();
   const results = searchArticles(articles, q);
   res.json({ query: q, sanitized: sanitizeQuery(q), count: results.length, results });
 });
-app.get('/debug/kb', async (req, res) => {
+app.get('/debug/kb', requireDebugToken, async (req, res) => {
   // Inspect the knowledge base built per article
   const articles = await getArticles();
   const enriched = articles.filter(a => a.extractedKeywords);
