@@ -953,8 +953,14 @@ function getArticleHint(article, ctx) {
   }
 
   // ── Locate eSIM in settings (distinct from install problems) ──────────────
-  if (title.includes('find') || title.includes('locat') || title.includes('see') ||
-      title.includes('show') || title.includes('visible') || title.includes('appear')) {
+  // Guard: only fire when the article is actually about locating/seeing an eSIM —
+  // prevents "Finding partner details" (Travel Partners category) from matching.
+  const isAboutLocatingESIM =
+    (title.includes('find') || title.includes('locat') || title.includes('see') ||
+     title.includes('show') || title.includes('visible') || title.includes('appear')) &&
+    (title.includes('esim') || title.includes('sim') ||
+     category.includes('install') || category.includes('start using') || category.includes('connect'));
+  if (isAboutLocatingESIM) {
     if (esimInstalled) {
       if (ctx.isIOS)
         return "eSIM installed — check Settings > Mobile Data (may show as 'Plus', 'TIM', 'Orange' or 'Proximus', NOT 'Kolet')";
