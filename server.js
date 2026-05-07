@@ -1836,10 +1836,32 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
 
       recordFeedback(rating, articleTitle, resolvedQuery, resolvedCtx, resolvedMeta, feedbackTitles);
 
-      const newRatedMap = { ...storedRated, [articleIdx]: rating };
+      let displaySuggs = storedSuggs;
+      let newRatedMap  = { ...storedRated };
 
-      if (storedSuggs.length > 0) {
-        return res.json(buildSuggestionsCanvas(storedSuggs, storedConvCtx, resolvedCtx, newRatedMap));
+      if (rating === 'down') {
+        // 👎 — remove the article from view immediately
+        displaySuggs = storedSuggs.filter((_, i) => i !== articleIdx);
+
+        // Remap ratedMap indices: articles after the removed one shift down by 1
+        newRatedMap = {};
+        for (const [idx, r] of Object.entries(storedRated)) {
+          const n = parseInt(idx, 10);
+          if      (n < articleIdx) newRatedMap[n]     = r;
+          else if (n > articleIdx) newRatedMap[n - 1] = r;
+          // n === articleIdx → removed, skip
+        }
+
+        // Keep server cache in sync so the article doesn't reappear on next action
+        if (cached) cached.titles = cached.titles.filter(t => t !== articleTitle);
+
+      } else {
+        // 👍 — keep article, replace buttons with confirmation text
+        newRatedMap[articleIdx] = 'up';
+      }
+
+      if (displaySuggs.length > 0) {
+        return res.json(buildSuggestionsCanvas(displaySuggs, storedConvCtx, resolvedCtx, newRatedMap));
       }
       return res.json(searchOnlyCanvas);
     }
