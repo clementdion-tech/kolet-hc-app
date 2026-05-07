@@ -62,14 +62,17 @@ let lastError  = {};
 const feedbackLog  = [];
 const FEEDBACK_MAX = 500;
 
-function recordFeedback(rating, convQuery, ctx, meta, shownArticles) {
+// articleTitle: the specific article being rated
+// allTitles: all article titles shown in the same set (for context)
+function recordFeedback(rating, articleTitle, convQuery, ctx, meta, allTitles) {
   const entry = {
     ts:             new Date().toISOString(),
-    rating,                                      // 'up' | 'down'
+    rating,                                       // 'up' | 'down'
+    rated_article:  articleTitle,                 // specific article rated
+    other_articles: allTitles.filter(t => t !== articleTitle),
     conv_query:     convQuery,
     inbox_name:     meta.inbox_name || '',
     tags:           meta.tags       || [],
-    shown_articles: shownArticles,               // article titles shown to agent
     ctx_signals:    ctx ? {
       esimStatus:      ctx.esimStatus      || null,
       partnerSlug:     ctx.partnerSlug     || null,
@@ -82,7 +85,7 @@ function recordFeedback(rating, convQuery, ctx, meta, shownArticles) {
   };
   feedbackLog.push(entry);
   if (feedbackLog.length > FEEDBACK_MAX) feedbackLog.shift();
-  console.log(`FEEDBACK ${rating.toUpperCase()} | inbox="${entry.inbox_name}" | query="${convQuery.slice(0, 60)}" | articles=${JSON.stringify(shownArticles)}`);
+  console.log(`FEEDBACK ${rating.toUpperCase()} | "${articleTitle}" | query="${convQuery.slice(0, 60)}"`);
 }
 
 // --- Notion cache ---
@@ -1438,8 +1441,9 @@ function getArticleEmoji(article) {
 // --- Canvas builders ---
 
 // Shared article list renderer used by both suggestions and results canvases.
-// withEmoji = true → prepend category emoji to button label (suggestions view).
-function renderArticleComponents(articles, ctx, withEmoji = false) {
+// withEmoji = true  → prepend category emoji (suggestions view).
+// ratedMap         → { [index]: 'up'|'down' } — shows confirmation instead of buttons.
+function renderArticleComponents(articles, ctx, withEmoji = false, ratedMap = {}) {
   const components = [];
   for (let i = 0; i < articles.length; i++) {
     const article = articles[i];
@@ -1457,6 +1461,27 @@ function renderArticleComponents(articles, ctx, withEmoji = false) {
     });
     if (hint) {
       components.push({ type: 'text', text: `⚡ ${hint}`, style: 'muted' });
+    }
+    // Per-article feedback — only on suggestions view (withEmoji === true)
+    if (withEmoji) {
+      if (ratedMap[i]) {
+        components.push({
+          type:  'text',
+          text:  ratedMap[i] === 'up' ? '👍 Marked helpful' : '👎 Marked not helpful',
+          style: 'muted',
+        });
+      } else {
+        components.push({
+          type: 'button', id: `feedback_up_${i}`,
+          label: '👍', style: 'secondary',
+          action: { type: 'submit' },
+        });
+        components.push({
+          type: 'button', id: `feedback_down_${i}`,
+          label: '👎', style: 'secondary',
+          action: { type: 'submit' },
+        });
+      }
     }
   }
   return components;
@@ -1481,8 +1506,9 @@ function searchInputComponents() {
   ];
 }
 
-// feedbackDone: null (show buttons) | 'up' | 'down' (show confirmation instead)
-function buildSuggestionsCanvas(articles, convCtx, ctx, feedbackDone = null) {
+// ratedMap: { [articleIndex]: 'up'|'down' } — persisted across re-renders
+// so each article keeps its confirmation state after being rated.
+function buildSuggestionsCanvas(articles, convCtx, ctx, ratedMap = {}) {
   const contextLabel = buildConvContextLabel(convCtx);
 
   const components = [
@@ -1493,39 +1519,17 @@ function buildSuggestionsCanvas(articles, convCtx, ctx, feedbackDone = null) {
   if (contextLabel) {
     components.push({ type: 'text', text: contextLabel, style: 'muted' });
   }
-  components.push(...renderArticleComponents(articles, ctx, true));
-
-  // Feedback row — replaced by a confirmation once rated
-  components.push({ type: 'divider' });
-  if (feedbackDone) {
-    components.push({
-      type:  'text',
-      text:  feedbackDone === 'up' ? '👍 Thanks — noted as helpful!' : '👎 Thanks — we\'ll use this to improve.',
-      style: 'muted',
-    });
-  } else {
-    components.push({ type: 'text', text: 'Were these suggestions helpful?', style: 'muted' });
-    components.push({
-      type: 'button', id: 'feedback_up',
-      label: '👍 Yes, helpful', style: 'secondary',
-      action: { type: 'submit' },
-    });
-    components.push({
-      type: 'button', id: 'feedback_down',
-      label: '👎 Not helpful', style: 'secondary',
-      action: { type: 'submit' },
-    });
-  }
+  components.push(...renderArticleComponents(articles, ctx, true, ratedMap));
 
   return {
     canvas: {
       stored_data: {
-        conv_query:       convCtx ? buildConvSearchQuery(convCtx).slice(0, 400) : '',
-        ctx:              ctx || null,
-        inbox_name:       convCtx?.inboxName || '',
-        tags:             convCtx?.tags      || [],
-        // Compact article list for feedback logging (titles only)
+        conv_query:        convCtx ? buildConvSearchQuery(convCtx).slice(0, 400) : '',
+        ctx:               ctx || null,
+        inbox_name:        convCtx?.inboxName || '',
+        tags:              convCtx?.tags      || [],
         feedback_articles: articles.slice(0, 7).map(a => a.title),
+        rated:             ratedMap,
       },
       content: { components },
     },
@@ -1642,18 +1646,26 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     const storedCtx            = storedData.ctx               || null;
     const storedMeta           = { inbox_name: storedData.inbox_name || '', tags: storedData.tags || [] };
     const storedFeedbackArts   = storedData.feedback_articles || [];
+    const storedRated          = storedData.rated             || {};
 
     // URL buttons open Notion directly — no state change needed
     if (componentId.startsWith('open_')) {
       return res.status(200).end();
     }
 
-    // ── Feedback (👍 / 👎) ────────────────────────────────────────────────────
-    if (componentId === 'feedback_up' || componentId === 'feedback_down') {
-      const rating = componentId === 'feedback_up' ? 'up' : 'down';
-      recordFeedback(rating, storedConvQuery, storedCtx, storedMeta, storedFeedbackArts);
+    // ── Per-article feedback (feedback_up_N / feedback_down_N) ───────────────
+    const feedbackMatch = componentId.match(/^feedback_(up|down)_(\d+)$/);
+    if (feedbackMatch) {
+      const rating      = feedbackMatch[1];                           // 'up' | 'down'
+      const articleIdx  = parseInt(feedbackMatch[2], 10);
+      const articleTitle = storedFeedbackArts[articleIdx] || `article_${articleIdx}`;
 
-      // Re-render same suggestions with a confirmation note instead of the buttons
+      recordFeedback(rating, articleTitle, storedConvQuery, storedCtx, storedMeta, storedFeedbackArts);
+
+      // Persist rating in the map so confirmation replaces the buttons for that article
+      const newRatedMap = { ...storedRated, [articleIdx]: rating };
+
+      // Re-render same suggestions with updated ratedMap
       if (storedCtx || storedConvQuery) {
         const backConvCtx = {
           text: storedConvQuery, fullText: storedConvQuery,
@@ -1663,13 +1675,10 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
         const rawResults  = storedConvQuery ? searchArticles(articles, storedConvQuery) : [];
         const suggestions = applyContextBoosts(articles, rawResults, storedCtx, backConvCtx);
         if (suggestions.length > 0) {
-          return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx, rating));
+          return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx, newRatedMap));
         }
       }
-      // Fallback — no context to rebuild from
-      return res.json(buildErrorCanvas(
-        rating === 'up' ? '👍 Thanks — noted as helpful!' : '👎 Thanks — we\'ll use this to improve.'
-      ));
+      return res.json(searchOnlyCanvas);
     }
 
     // Back to suggestions — re-run the suggestion engine from stored conv context
@@ -1765,28 +1774,29 @@ app.get('/debug/feedback', requireDebugToken, (req, res) => {
   const downs = feedbackLog.filter(f => f.rating === 'down').length;
   const total = feedbackLog.length;
 
-  // Frequency table: how often each article title appeared in rated sets
+  // Per-article stats: how many times each article was rated 👍 or 👎 directly
   const articleStats = {};
   for (const entry of feedbackLog) {
-    for (const title of (entry.shown_articles || [])) {
-      if (!articleStats[title]) articleStats[title] = { ups: 0, downs: 0 };
-      if (entry.rating === 'up')   articleStats[title].ups++;
-      else                          articleStats[title].downs++;
-    }
+    const t = entry.rated_article;
+    if (!t) continue;
+    if (!articleStats[t]) articleStats[t] = { ups: 0, downs: 0 };
+    if (entry.rating === 'up') articleStats[t].ups++;
+    else                        articleStats[t].downs++;
   }
   const rankedArticles = Object.entries(articleStats)
-    .map(([title, s]) => ({ title, ups: s.ups, downs: s.downs, total: s.ups + s.downs }))
+    .map(([title, s]) => ({
+      title,
+      ups:       s.ups,
+      downs:     s.downs,
+      total:     s.ups + s.downs,
+      score_pct: s.ups + s.downs ? `${Math.round(s.ups / (s.ups + s.downs) * 100)}%` : 'n/a',
+    }))
     .sort((a, b) => b.total - a.total);
 
   res.json({
-    summary: {
-      total,
-      ups,
-      downs,
-      accuracy: total ? `${Math.round(ups / total * 100)}%` : 'n/a',
-    },
+    summary: { total, ups, downs, helpful_rate: total ? `${Math.round(ups / total * 100)}%` : 'n/a' },
     article_stats: rankedArticles,
-    entries: feedbackLog.slice().reverse(),  // most recent first
+    entries: feedbackLog.slice().reverse(),
   });
 });
 
