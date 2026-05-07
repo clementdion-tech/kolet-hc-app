@@ -56,6 +56,26 @@ let lastInit   = {};
 let lastSubmit = {};
 let lastError  = {};
 
+// --- Server-side conversation suggestion cache ---
+// Keyed by Intercom conversation ID. Survives stored_data round-trip failures.
+// Intercom's canvas submit payload uses `canvas.stored_data` (not `canvas_data`),
+// and we've seen it be unreliable — this cache is the primary source of truth.
+const convSuggestionsCache = new Map();
+const CONV_CACHE_MAX = 2000;
+
+function cacheConvSuggestions(convId, titles, convQuery, ctx, meta) {
+  if (!convId) return;
+  convSuggestionsCache.set(String(convId), { titles, convQuery, ctx, meta, ts: Date.now() });
+  // Evict oldest entries if over limit
+  if (convSuggestionsCache.size > CONV_CACHE_MAX) {
+    convSuggestionsCache.delete(convSuggestionsCache.keys().next().value);
+  }
+}
+
+function getCachedConvSuggestions(convId) {
+  return convId ? convSuggestionsCache.get(String(convId)) : null;
+}
+
 // --- Feedback log ---
 // In-memory ring buffer — persists across requests, resets on redeploy.
 // Exported via /debug/feedback for review and future training use.
@@ -1626,10 +1646,11 @@ app.post('/intercom/initialize', verifyIntercomRequest, async (req, res) => {
   try {
     lastInit = req.body;
 
+    const convId  = String(req.body.conversation?.id || '');
     const convCtx = extractConversationContext(req.body);
     const ctx     = extractContactContext(req.body);
 
-    console.log('INIT inbox:', convCtx.inboxName, '| topic:', convCtx.topic);
+    console.log('INIT conv:', convId, '| inbox:', convCtx.inboxName, '| topic:', convCtx.topic);
     console.log('INIT text (first 200):', convCtx.text.slice(0, 200));
     console.log('INIT esim:', ctx.esimStatus, '| partner:', ctx.partnerSlug);
 
@@ -1640,7 +1661,11 @@ app.post('/intercom/initialize', verifyIntercomRequest, async (req, res) => {
       const rawResults  = searchArticles(articles, augmentedQuery);
       const suggestions = applyContextBoosts(articles, rawResults, ctx, convCtx);
       if (suggestions.length > 0) {
-        console.log(`Suggested ${suggestions.length} articles for inbox="${convCtx.inboxName}"`);
+        console.log(`Suggested ${suggestions.length} articles for conv=${convId} inbox="${convCtx.inboxName}"`);
+        // Cache by conversation ID — submit handler uses this as primary source
+        cacheConvSuggestions(convId, suggestions.map(a => a.title),
+          buildConvSearchQuery(convCtx).slice(0, 400), ctx,
+          { inbox_name: convCtx.inboxName, tags: convCtx.tags });
         return res.json(buildSuggestionsCanvas(suggestions, convCtx, ctx));
       }
     }
@@ -1658,33 +1683,46 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     lastSubmit = req.body;
     console.log('SUBMIT component_id:', req.body.component_id);
 
-    const componentId        = req.body.component_id || '';
-    const storedData         = req.body.canvas_data?.stored_data || {};
-    const storedConvQuery    = storedData.conv_query        || '';
-    const storedCtx          = storedData.ctx               || null;
-    const storedMeta         = { inbox_name: storedData.inbox_name || '', tags: storedData.tags || [] };
-    const storedFeedbackArts = storedData.feedback_articles || [];
-    const storedRated        = storedData.rated             || {};
+    const componentId = req.body.component_id || '';
+    const convId      = String(req.body.conversation?.id || '');
+
+    // Intercom Canvas Kit sends stored_data under `canvas.stored_data`.
+    // We also check `canvas_data.stored_data` as a fallback for older payloads.
+    // Primary source of truth is the server-side convSuggestionsCache.
+    const storedData  = req.body.canvas?.stored_data
+                     || req.body.canvas_data?.stored_data
+                     || {};
+    console.log('SUBMIT conv:', convId, '| component:', componentId,
+                '| storedData keys:', Object.keys(storedData).join(','));
+
+    // Merge: server cache wins over stored_data (more reliable)
+    const cached          = getCachedConvSuggestions(convId);
+    const feedbackTitles  = cached?.titles          || storedData.feedback_articles || [];
+    const resolvedCtx     = cached?.ctx             || storedData.ctx               || null;
+    const resolvedQuery   = cached?.convQuery       || storedData.conv_query        || '';
+    const resolvedMeta    = cached?.meta            || { inbox_name: storedData.inbox_name || '', tags: storedData.tags || [] };
+    const storedRated     = storedData.rated        || {};
+
+    console.log('SUBMIT sugg titles:', feedbackTitles.length, '| cached:', Boolean(cached));
 
     // URL buttons open Notion directly — no state change needed
     if (componentId.startsWith('open_')) {
       return res.status(200).end();
     }
 
-    // Helper: restore the exact suggestion articles shown (by title lookup).
-    // More reliable than re-running the engine because it doesn't depend on
-    // ctx / conv_query surviving Intercom's stored_data round-trip.
-    const allArticles  = await getArticles();
-    const storedSuggs  = storedFeedbackArts
+    // Restore the exact suggestion articles shown (by title lookup from KB cache).
+    // This works even when stored_data is empty — feedbackTitles comes from
+    // the server-side conversation cache set during /initialize.
+    const allArticles = await getArticles();
+    const storedSuggs = feedbackTitles
       .map(title => allArticles.find(a => a.title === title))
       .filter(Boolean);
 
-    // Minimal convCtx reconstructed from stored scalars (for label + stored_data)
     const storedConvCtx = {
-      text:      storedConvQuery,
-      fullText:  storedConvQuery,
-      inboxName: storedMeta.inbox_name,
-      tags:      storedMeta.tags,
+      text:      resolvedQuery,
+      fullText:  resolvedQuery,
+      inboxName: resolvedMeta.inbox_name,
+      tags:      resolvedMeta.tags,
       topic:     '',
     };
 
@@ -1693,14 +1731,14 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     if (feedbackMatch) {
       const rating       = feedbackMatch[1];
       const articleIdx   = parseInt(feedbackMatch[2], 10);
-      const articleTitle = storedFeedbackArts[articleIdx] || `article_${articleIdx}`;
+      const articleTitle = feedbackTitles[articleIdx] || `article_${articleIdx}`;
 
-      recordFeedback(rating, articleTitle, storedConvQuery, storedCtx, storedMeta, storedFeedbackArts);
+      recordFeedback(rating, articleTitle, resolvedQuery, resolvedCtx, resolvedMeta, feedbackTitles);
 
       const newRatedMap = { ...storedRated, [articleIdx]: rating };
 
       if (storedSuggs.length > 0) {
-        return res.json(buildSuggestionsCanvas(storedSuggs, storedConvCtx, storedCtx, newRatedMap));
+        return res.json(buildSuggestionsCanvas(storedSuggs, storedConvCtx, resolvedCtx, newRatedMap));
       }
       return res.json(searchOnlyCanvas);
     }
@@ -1709,7 +1747,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     // Suggestions never disappear — back_btn just hides the search results section.
     if (componentId === 'back_btn') {
       if (storedSuggs.length > 0) {
-        return res.json(buildSuggestionsCanvas(storedSuggs, storedConvCtx, storedCtx, storedRated));
+        return res.json(buildSuggestionsCanvas(storedSuggs, storedConvCtx, resolvedCtx, storedRated));
       }
       return res.json(searchOnlyCanvas);
     }
@@ -1722,24 +1760,24 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     if (!query) {
       // Empty/cleared search — show suggestions without search results section
       if (storedSuggs.length > 0) {
-        return res.json(buildSuggestionsCanvas(storedSuggs, storedConvCtx, storedCtx, storedRated));
+        return res.json(buildSuggestionsCanvas(storedSuggs, storedConvCtx, resolvedCtx, storedRated));
       }
       return res.json(searchOnlyCanvas);
     }
 
     const searchRaw     = searchArticles(allArticles, query);
-    const searchResults = applyContextBoosts(allArticles, searchRaw, storedCtx);
+    const searchResults = applyContextBoosts(allArticles, searchRaw, resolvedCtx);
     console.log(`Found ${searchResults.length} for "${query}"`);
 
     if (storedSuggs.length > 0) {
       // Show suggestions + search results together — suggestions always stay visible
       return res.json(buildSuggestionsCanvas(
-        storedSuggs, storedConvCtx, storedCtx, storedRated,
+        storedSuggs, storedConvCtx, resolvedCtx, storedRated,
         { query, results: searchResults }
       ));
     }
     // No stored suggestions — show search results only (search-only conversation)
-    return res.json(buildResultsCanvas(`Results for "${query}"`, searchResults, storedConvQuery || null, storedCtx, storedMeta));
+    return res.json(buildResultsCanvas(`Results for "${query}"`, searchResults, resolvedQuery || null, resolvedCtx, resolvedMeta));
 
   } catch (err) {
     lastError = { route: 'submit', message: err.message, stack: err.stack, time: new Date().toISOString() };
@@ -1755,6 +1793,11 @@ app.use((err, req, res, next) => {
 });
 
 // Debug endpoints — protected by DEBUG_TOKEN env var
+app.get('/debug/conv-cache',  requireDebugToken, (req, res) => {
+  const entries = [];
+  for (const [id, v] of convSuggestionsCache) entries.push({ id, titles: v.titles, ts: v.ts });
+  res.json({ size: convSuggestionsCache.size, entries: entries.slice(-50).reverse() });
+});
 app.get('/debug/last-init',   requireDebugToken, (req, res) => res.json(lastInit));
 app.get('/debug/last-error',  requireDebugToken, (req, res) => res.json(lastError));
 app.get('/debug/last-submit', requireDebugToken, (req, res) => res.json(lastSubmit));
