@@ -964,15 +964,24 @@ function searchArticles(articles, rawQuery) {
     // messages) would require ~12 words to appear in a single article, making
     // it impossible for any article to pass. Capping at 10 keeps the check
     // meaningful for both 2-word manual queries and full conversation threads.
+    //
+    // IMPORTANT: the check must also apply to single-word queries (the `>= 2`
+    // guard was removed). Without it a query like "refund" expands to synonyms
+    // including "billing", "cancel", etc. and unrelated articles (e.g. the VoIP
+    // article) can earn a non-zero score from those distant synonyms even though
+    // the raw query word never appears in them.  The fix: for ≤ 2 raw terms use
+    // a stricter 50 % threshold (at least one raw term must appear); for longer
+    // queries keep the 30 % threshold.
     const checkTerms = rawWords.length > 10
       ? [...rawWords].sort((a, b) => (idf[b] || 1) - (idf[a] || 1)).slice(0, 10)
       : rawWords;
-    if (checkTerms.length >= 2) {
+    if (checkTerms.length >= 1) {
+      const threshold  = checkTerms.length <= 2 ? 0.50 : 0.30;
       const directHits = checkTerms.filter(w =>
         title.includes(w) || category.includes(w) ||
         keywords.includes(w) || extkw.includes(w) || content.includes(w)
       ).length;
-      if (directHits / checkTerms.length < 0.30) return { ...article, score: 0 };
+      if (directHits / checkTerms.length < threshold) return { ...article, score: 0 };
     }
 
     return { ...article, score };
