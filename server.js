@@ -421,7 +421,9 @@ async function enrichArticleContent(articles) {
     }
     if (i + 3 < articles.length) await new Promise(r => setTimeout(r, 300));
   }
-  console.log('Knowledge base build complete');
+  // Rebuild IDF cache now that extractedKeywords is fully populated
+  articleDfCache = buildDfCache(articles);
+  console.log('Knowledge base build complete — IDF cache rebuilt');
 }
 
 // Customer language → article terms. Each key maps to terms likely in article titles/categories.
@@ -557,6 +559,7 @@ const SYNONYMS = {
 // Reverse index: synonym value → parent key (built once at startup)
 const SYNONYM_REVERSE = new Map();
 for (const [key, syns] of Object.entries(SYNONYMS)) {
+  if (!Array.isArray(syns)) continue;  // guard against null/non-array values
   for (const s of syns) SYNONYM_REVERSE.set(s, key);
 }
 
