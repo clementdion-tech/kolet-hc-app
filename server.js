@@ -56,6 +56,35 @@ let lastInit   = {};
 let lastSubmit = {};
 let lastError  = {};
 
+// --- Feedback log ---
+// In-memory ring buffer — persists across requests, resets on redeploy.
+// Exported via /debug/feedback for review and future training use.
+const feedbackLog  = [];
+const FEEDBACK_MAX = 500;
+
+function recordFeedback(rating, convQuery, ctx, meta, shownArticles) {
+  const entry = {
+    ts:             new Date().toISOString(),
+    rating,                                      // 'up' | 'down'
+    conv_query:     convQuery,
+    inbox_name:     meta.inbox_name || '',
+    tags:           meta.tags       || [],
+    shown_articles: shownArticles,               // article titles shown to agent
+    ctx_signals:    ctx ? {
+      esimStatus:      ctx.esimStatus      || null,
+      partnerSlug:     ctx.partnerSlug     || null,
+      isIOS:           ctx.isIOS           || false,
+      isAndroid:       ctx.isAndroid       || false,
+      isB2B:           ctx.isB2B           || false,
+      fraudSuspected:  ctx.fraudSuspected  || false,
+      planZone:        ctx.planZone        || null,
+    } : null,
+  };
+  feedbackLog.push(entry);
+  if (feedbackLog.length > FEEDBACK_MAX) feedbackLog.shift();
+  console.log(`FEEDBACK ${rating.toUpperCase()} | inbox="${entry.inbox_name}" | query="${convQuery.slice(0, 60)}" | articles=${JSON.stringify(shownArticles)}`);
+}
+
 // --- Notion cache ---
 let articleCache   = null;
 let cacheExpiry    = 0;
@@ -1452,7 +1481,8 @@ function searchInputComponents() {
   ];
 }
 
-function buildSuggestionsCanvas(articles, convCtx, ctx) {
+// feedbackDone: null (show buttons) | 'up' | 'down' (show confirmation instead)
+function buildSuggestionsCanvas(articles, convCtx, ctx, feedbackDone = null) {
   const contextLabel = buildConvContextLabel(convCtx);
 
   const components = [
@@ -1465,16 +1495,37 @@ function buildSuggestionsCanvas(articles, convCtx, ctx) {
   }
   components.push(...renderArticleComponents(articles, ctx, true));
 
+  // Feedback row — replaced by a confirmation once rated
+  components.push({ type: 'divider' });
+  if (feedbackDone) {
+    components.push({
+      type:  'text',
+      text:  feedbackDone === 'up' ? '👍 Thanks — noted as helpful!' : '👎 Thanks — we\'ll use this to improve.',
+      style: 'muted',
+    });
+  } else {
+    components.push({ type: 'text', text: 'Were these suggestions helpful?', style: 'muted' });
+    components.push({
+      type: 'button', id: 'feedback_up',
+      label: '👍 Yes, helpful', style: 'secondary',
+      action: { type: 'submit' },
+    });
+    components.push({
+      type: 'button', id: 'feedback_down',
+      label: '👎 Not helpful', style: 'secondary',
+      action: { type: 'submit' },
+    });
+  }
+
   return {
     canvas: {
       stored_data: {
-        conv_query:  convCtx ? buildConvSearchQuery(convCtx).slice(0, 400) : '',
-        ctx:         ctx || null,
-        // Keep inbox_name and tags so back-button intent detection works correctly.
-        // We re-run the suggestion engine on back rather than caching articles,
-        // avoiding stored_data size limits.
-        inbox_name: convCtx?.inboxName || '',
-        tags:        convCtx?.tags     || [],
+        conv_query:       convCtx ? buildConvSearchQuery(convCtx).slice(0, 400) : '',
+        ctx:              ctx || null,
+        inbox_name:       convCtx?.inboxName || '',
+        tags:             convCtx?.tags      || [],
+        // Compact article list for feedback logging (titles only)
+        feedback_articles: articles.slice(0, 7).map(a => a.title),
       },
       content: { components },
     },
@@ -1585,15 +1636,40 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     lastSubmit = req.body;
     console.log('SUBMIT component_id:', req.body.component_id);
 
-    const componentId     = req.body.component_id || '';
-    const storedData      = req.body.canvas_data?.stored_data || {};
-    const storedConvQuery = storedData.conv_query  || '';
-    const storedCtx       = storedData.ctx         || null;
-    const storedMeta      = { inbox_name: storedData.inbox_name || '', tags: storedData.tags || [] };
+    const componentId          = req.body.component_id || '';
+    const storedData           = req.body.canvas_data?.stored_data || {};
+    const storedConvQuery      = storedData.conv_query        || '';
+    const storedCtx            = storedData.ctx               || null;
+    const storedMeta           = { inbox_name: storedData.inbox_name || '', tags: storedData.tags || [] };
+    const storedFeedbackArts   = storedData.feedback_articles || [];
 
     // URL buttons open Notion directly — no state change needed
     if (componentId.startsWith('open_')) {
       return res.status(200).end();
+    }
+
+    // ── Feedback (👍 / 👎) ────────────────────────────────────────────────────
+    if (componentId === 'feedback_up' || componentId === 'feedback_down') {
+      const rating = componentId === 'feedback_up' ? 'up' : 'down';
+      recordFeedback(rating, storedConvQuery, storedCtx, storedMeta, storedFeedbackArts);
+
+      // Re-render same suggestions with a confirmation note instead of the buttons
+      if (storedCtx || storedConvQuery) {
+        const backConvCtx = {
+          text: storedConvQuery, fullText: storedConvQuery,
+          inboxName: storedMeta.inbox_name, tags: storedMeta.tags, topic: '',
+        };
+        const articles    = await getArticles();
+        const rawResults  = storedConvQuery ? searchArticles(articles, storedConvQuery) : [];
+        const suggestions = applyContextBoosts(articles, rawResults, storedCtx, backConvCtx);
+        if (suggestions.length > 0) {
+          return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx, rating));
+        }
+      }
+      // Fallback — no context to rebuild from
+      return res.json(buildErrorCanvas(
+        rating === 'up' ? '👍 Thanks — noted as helpful!' : '👎 Thanks — we\'ll use this to improve.'
+      ));
     }
 
     // Back to suggestions — re-run the suggestion engine from stored conv context
@@ -1684,6 +1760,36 @@ app.get('/debug/kb', requireDebugToken, async (req, res) => {
     })),
   });
 });
+app.get('/debug/feedback', requireDebugToken, (req, res) => {
+  const ups   = feedbackLog.filter(f => f.rating === 'up').length;
+  const downs = feedbackLog.filter(f => f.rating === 'down').length;
+  const total = feedbackLog.length;
+
+  // Frequency table: how often each article title appeared in rated sets
+  const articleStats = {};
+  for (const entry of feedbackLog) {
+    for (const title of (entry.shown_articles || [])) {
+      if (!articleStats[title]) articleStats[title] = { ups: 0, downs: 0 };
+      if (entry.rating === 'up')   articleStats[title].ups++;
+      else                          articleStats[title].downs++;
+    }
+  }
+  const rankedArticles = Object.entries(articleStats)
+    .map(([title, s]) => ({ title, ups: s.ups, downs: s.downs, total: s.ups + s.downs }))
+    .sort((a, b) => b.total - a.total);
+
+  res.json({
+    summary: {
+      total,
+      ups,
+      downs,
+      accuracy: total ? `${Math.round(ups / total * 100)}%` : 'n/a',
+    },
+    article_stats: rankedArticles,
+    entries: feedbackLog.slice().reverse(),  // most recent first
+  });
+});
+
 app.get('/health', (req, res) => res.json({ ok: true, cached: articleCache?.length || 0, enriched: articleCache?.filter(a => a.extractedKeywords).length || 0 }));
 
 getArticles().catch(err => console.error('Cache warm failed:', err.message));
