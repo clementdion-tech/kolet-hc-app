@@ -1506,9 +1506,10 @@ function searchInputComponents() {
   ];
 }
 
-// ratedMap: { [articleIndex]: 'up'|'down' } — persisted across re-renders
-// so each article keeps its confirmation state after being rated.
-function buildSuggestionsCanvas(articles, convCtx, ctx, ratedMap = {}) {
+// ratedMap:     { [articleIndex]: 'up'|'down' } — per-article feedback state.
+// searchSection: { query, results } — when present, appended below suggestions.
+//                Suggestions are ALWAYS visible; search results are additive.
+function buildSuggestionsCanvas(articles, convCtx, ctx, ratedMap = {}, searchSection = null) {
   const contextLabel = buildConvContextLabel(convCtx);
 
   const components = [
@@ -1520,6 +1521,23 @@ function buildSuggestionsCanvas(articles, convCtx, ctx, ratedMap = {}) {
     components.push({ type: 'text', text: contextLabel, style: 'muted' });
   }
   components.push(...renderArticleComponents(articles, ctx, true, ratedMap));
+
+  // Append search results below — suggestions never disappear
+  if (searchSection) {
+    components.push({ type: 'divider' });
+    components.push({ type: 'text', text: `Results for "${searchSection.query}"`, style: 'header' });
+    components.push({
+      type: 'button', id: 'back_btn',
+      label: '✕ Clear results',
+      style: 'secondary',
+      action: { type: 'submit' },
+    });
+    if (searchSection.results.length === 0) {
+      components.push({ type: 'text', text: 'No articles found.', style: 'muted' });
+    } else {
+      components.push(...renderArticleComponents(searchSection.results, ctx, false));
+    }
+  }
 
   return {
     canvas: {
@@ -1640,95 +1658,88 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     lastSubmit = req.body;
     console.log('SUBMIT component_id:', req.body.component_id);
 
-    const componentId          = req.body.component_id || '';
-    const storedData           = req.body.canvas_data?.stored_data || {};
-    const storedConvQuery      = storedData.conv_query        || '';
-    const storedCtx            = storedData.ctx               || null;
-    const storedMeta           = { inbox_name: storedData.inbox_name || '', tags: storedData.tags || [] };
-    const storedFeedbackArts   = storedData.feedback_articles || [];
-    const storedRated          = storedData.rated             || {};
+    const componentId        = req.body.component_id || '';
+    const storedData         = req.body.canvas_data?.stored_data || {};
+    const storedConvQuery    = storedData.conv_query        || '';
+    const storedCtx          = storedData.ctx               || null;
+    const storedMeta         = { inbox_name: storedData.inbox_name || '', tags: storedData.tags || [] };
+    const storedFeedbackArts = storedData.feedback_articles || [];
+    const storedRated        = storedData.rated             || {};
 
     // URL buttons open Notion directly — no state change needed
     if (componentId.startsWith('open_')) {
       return res.status(200).end();
     }
 
+    // Helper: restore the exact suggestion articles shown (by title lookup).
+    // More reliable than re-running the engine because it doesn't depend on
+    // ctx / conv_query surviving Intercom's stored_data round-trip.
+    const allArticles  = await getArticles();
+    const storedSuggs  = storedFeedbackArts
+      .map(title => allArticles.find(a => a.title === title))
+      .filter(Boolean);
+
+    // Minimal convCtx reconstructed from stored scalars (for label + stored_data)
+    const storedConvCtx = {
+      text:      storedConvQuery,
+      fullText:  storedConvQuery,
+      inboxName: storedMeta.inbox_name,
+      tags:      storedMeta.tags,
+      topic:     '',
+    };
+
     // ── Per-article feedback (feedback_up_N / feedback_down_N) ───────────────
     const feedbackMatch = componentId.match(/^feedback_(up|down)_(\d+)$/);
     if (feedbackMatch) {
-      const rating      = feedbackMatch[1];                           // 'up' | 'down'
-      const articleIdx  = parseInt(feedbackMatch[2], 10);
+      const rating       = feedbackMatch[1];
+      const articleIdx   = parseInt(feedbackMatch[2], 10);
       const articleTitle = storedFeedbackArts[articleIdx] || `article_${articleIdx}`;
 
       recordFeedback(rating, articleTitle, storedConvQuery, storedCtx, storedMeta, storedFeedbackArts);
 
-      // Persist rating in the map so confirmation replaces the buttons for that article
       const newRatedMap = { ...storedRated, [articleIdx]: rating };
 
-      // Re-render same suggestions with updated ratedMap
-      if (storedCtx || storedConvQuery) {
-        const backConvCtx = {
-          text: storedConvQuery, fullText: storedConvQuery,
-          inboxName: storedMeta.inbox_name, tags: storedMeta.tags, topic: '',
-        };
-        const articles    = await getArticles();
-        const rawResults  = storedConvQuery ? searchArticles(articles, storedConvQuery) : [];
-        const suggestions = applyContextBoosts(articles, rawResults, storedCtx, backConvCtx);
-        if (suggestions.length > 0) {
-          return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx, newRatedMap));
-        }
+      if (storedSuggs.length > 0) {
+        return res.json(buildSuggestionsCanvas(storedSuggs, storedConvCtx, storedCtx, newRatedMap));
       }
       return res.json(searchOnlyCanvas);
     }
 
-    // Back to suggestions — re-run the suggestion engine from stored conv context
-    // so we're never dependent on cached article data in stored_data.
-    // storedConvQuery may be empty when suggestions came purely from contact
-    // attributes (partnerKeyword, eSIM state, etc.) — gate on storedCtx too.
+    // ── Clear search results (back_btn) ──────────────────────────────────────
+    // Suggestions never disappear — back_btn just hides the search results section.
     if (componentId === 'back_btn') {
-      if (storedCtx || storedConvQuery) {
-        const backConvCtx = {
-          text:      storedConvQuery,
-          fullText:  storedConvQuery,
-          inboxName: storedMeta.inbox_name,
-          tags:      storedMeta.tags,
-          topic:     '',
-        };
-        const articles    = await getArticles();
-        const rawResults  = storedConvQuery ? searchArticles(articles, storedConvQuery) : [];
-        const suggestions = applyContextBoosts(articles, rawResults, storedCtx, backConvCtx);
-        if (suggestions.length > 0) {
-          console.log(`Back: restored ${suggestions.length} suggestions`);
-          return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx));
-        }
+      if (storedSuggs.length > 0) {
+        return res.json(buildSuggestionsCanvas(storedSuggs, storedConvCtx, storedCtx, storedRated));
       }
       return res.json(searchOnlyCanvas);
     }
 
+    // ── Search ────────────────────────────────────────────────────────────────
     const rawQuery = String(req.body.input_values?.search_query || '').slice(0, 300);
     const query    = sanitizeQuery(rawQuery);
     console.log(`Search: "${rawQuery}" -> "${query}"`);
 
     if (!query) {
-      // Empty search — go back to suggestions if we have context, otherwise search-only
-      if (storedCtx || storedConvQuery) {
-        const backConvCtx = {
-          text: storedConvQuery, fullText: storedConvQuery,
-          inboxName: storedMeta.inbox_name, tags: storedMeta.tags, topic: '',
-        };
-        const articles    = await getArticles();
-        const rawResults  = storedConvQuery ? searchArticles(articles, storedConvQuery) : [];
-        const suggestions = applyContextBoosts(articles, rawResults, storedCtx, backConvCtx);
-        if (suggestions.length > 0) return res.json(buildSuggestionsCanvas(suggestions, backConvCtx, storedCtx));
+      // Empty/cleared search — show suggestions without search results section
+      if (storedSuggs.length > 0) {
+        return res.json(buildSuggestionsCanvas(storedSuggs, storedConvCtx, storedCtx, storedRated));
       }
       return res.json(searchOnlyCanvas);
     }
 
-    const articles   = await getArticles();
-    const rawResults = searchArticles(articles, query);
-    const results    = applyContextBoosts(articles, rawResults, storedCtx);
-    console.log(`Found ${results.length} for "${query}"`);
-    return res.json(buildResultsCanvas(`Results for "${query}"`, results, storedConvQuery || null, storedCtx, storedMeta));
+    const searchRaw     = searchArticles(allArticles, query);
+    const searchResults = applyContextBoosts(allArticles, searchRaw, storedCtx);
+    console.log(`Found ${searchResults.length} for "${query}"`);
+
+    if (storedSuggs.length > 0) {
+      // Show suggestions + search results together — suggestions always stay visible
+      return res.json(buildSuggestionsCanvas(
+        storedSuggs, storedConvCtx, storedCtx, storedRated,
+        { query, results: searchResults }
+      ));
+    }
+    // No stored suggestions — show search results only (search-only conversation)
+    return res.json(buildResultsCanvas(`Results for "${query}"`, searchResults, storedConvQuery || null, storedCtx, storedMeta));
 
   } catch (err) {
     lastError = { route: 'submit', message: err.message, stack: err.stack, time: new Date().toISOString() };
