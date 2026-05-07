@@ -100,7 +100,7 @@ const FEEDBACK_MIN_CTX_VOTES = 2;  // need ≥2 context-specific votes to trust 
 
 // Build a compact fingerprint string from the current suggestion context.
 // Used to store / look up context-specific feedback votes.
-function buildContextFingerprint(ctx, meta, query) {
+function buildContextFingerprint(ctx, meta, query, intentsOverride = null) {
   const parts = [];
 
   if (ctx) {
@@ -127,7 +127,7 @@ function buildContextFingerprint(ctx, meta, query) {
     (meta?.tags || []).join(' '),
   ].join(' ').trim();
   if (signalText) {
-    const intents = detectIntents(signalText);
+    const intents = intentsOverride || detectIntents(signalText);
     if (intents.size) parts.push(`i:${[...intents].sort().join(',')}`);
   }
 
@@ -189,6 +189,8 @@ function recordFeedback(rating, articleTitle, convQuery, ctx, meta, allTitles) {
 
 // --- Notion cache ---
 let articleCache   = null;
+let articleDfCache = null; // pre-computed IDF weights per word (built by buildDfCache)
+let articleByTitle = null; // Map<title, article> for O(1) title lookups
 let cacheExpiry    = 0;
 let cacheInflight  = null; // deduplicates concurrent fetches
 const CACHE_TTL    = 5 * 60 * 1000;
@@ -253,8 +255,30 @@ async function getArticles() {
   // If a fetch is already in progress, wait for it rather than launching a second one
   if (cacheInflight) return cacheInflight;
 
+  // Clear derived caches so stale data isn't used during refresh
+  articleCache   = null;
+  articleDfCache = null;
+  articleByTitle = null;
+
   cacheInflight = _fetchArticles().finally(() => { cacheInflight = null; });
   return cacheInflight;
+}
+
+// Build df lookup when articles are loaded — called once per cache warm
+function buildDfCache(articles) {
+  const N = articles.length;
+  const df = {};
+  for (const a of articles) {
+    const hay = `${a.title} ${a.category} ${a.keywords} ${a.extractedKeywords}`.toLowerCase();
+    const words = new Set(hay.match(/\b\w+\b/g) || []);
+    for (const w of words) df[w] = (df[w] || 0) + 1;
+  }
+  // Pre-compute idf weight per word: log10((N+1)/(df+1))+1
+  const idf = {};
+  for (const [w, d] of Object.entries(df)) {
+    idf[w] = Math.log10((N + 1) / (d + 1)) + 1;
+  }
+  return idf;  // { word: idfWeight }
 }
 
 async function _fetchArticles() {
@@ -299,8 +323,10 @@ async function _fetchArticles() {
     cursor = data.has_more ? data.next_cursor : undefined;
   } while (cursor);
 
-  articleCache = results;
-  cacheExpiry = Date.now() + CACHE_TTL;
+  articleCache   = results;
+  articleByTitle = new Map(results.map(a => [a.title, a]));
+  articleDfCache = buildDfCache(results);
+  cacheExpiry    = Date.now() + CACHE_TTL;
   console.log(`Cached ${results.length} articles`);
 
   // Fetch page content in background (3 at a time, 300ms gap to avoid rate limits)
@@ -527,6 +553,12 @@ const SYNONYMS = {
                  '1234','0000','wrong pin','enter pin','pin required','puk required',
                  'esim pin','sim pin','locked sim','unlock sim'],
 };
+
+// Reverse index: synonym value → parent key (built once at startup)
+const SYNONYM_REVERSE = new Map();
+for (const [key, syns] of Object.entries(SYNONYMS)) {
+  for (const s of syns) SYNONYM_REVERSE.set(s, key);
+}
 
 // Regex-based intent detection — more robust than keyword expansion for short/noisy text.
 // Works across languages by matching common patterns rather than specific words.
@@ -777,11 +809,11 @@ function expandTerms(words, fullQuery) {
     if (SYNONYMS[word]) {
       SYNONYMS[word].forEach(s => expanded.add(s));
     }
-    for (const [key, syns] of Object.entries(SYNONYMS)) {
-      if (syns.some(s => s === word)) {
-        expanded.add(key);
-        syns.forEach(s => expanded.add(s));
-      }
+    // Reverse lookup using precomputed index
+    const parentKey = SYNONYM_REVERSE.get(word);
+    if (parentKey && !expanded.has(parentKey)) {
+      expanded.add(parentKey);
+      for (const s of (SYNONYMS[parentKey] || [])) expanded.add(s);
     }
   }
 
@@ -813,12 +845,17 @@ function computeQueryIDF(articles, rawTerms) {
   const N = Math.max(articles.length, 1);
   const weights = {};
   for (const term of rawTerms) {
-    let df = 0;
-    for (const a of articles) {
-      const hay = `${a.title} ${a.category} ${a.keywords} ${a.extractedKeywords}`.toLowerCase();
-      if (hay.includes(term)) df++;
+    if (articleDfCache && articleDfCache[term] !== undefined) {
+      weights[term] = articleDfCache[term];
+    } else {
+      // Fallback: scan (used only during warm-up before dfCache is ready)
+      let df = 0;
+      for (const a of articles) {
+        const hay = `${a.title} ${a.category} ${a.keywords} ${a.extractedKeywords}`.toLowerCase();
+        if (hay.includes(term)) df++;
+      }
+      weights[term] = Math.log10((N + 1) / (df + 1)) + 1;
     }
-    weights[term] = Math.log10((N + 1) / (df + 1)) + 1;
   }
   return weights;
 }
@@ -1327,10 +1364,12 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
   }
 
   // Pre-compute context fingerprint once (used in Step 5 for feedback multiplier)
+  // Pass the already-computed intents Set to avoid re-running detectIntents
   const ctxFingerprint = buildContextFingerprint(
     ctx,
     convCtx ? { inbox_name: convCtx.inboxName, tags: convCtx.tags } : {},
-    convCtx?.text || ''
+    convCtx?.text || '',
+    intents
   );
 
   return combined.map(article => {
@@ -1745,7 +1784,7 @@ app.get('/intercom/initialize', (req, res) => res.json(searchOnlyCanvas));
 
 app.post('/intercom/initialize', verifyIntercomRequest, async (req, res) => {
   try {
-    lastInit = req.body;
+    lastInit = { convId: req.body.conversation?.id, ts: new Date().toISOString(), inboxName: req.body.conversation?.assignee?.name };
 
     const convId  = String(req.body.conversation?.id || '');
     const convCtx = extractConversationContext(req.body);
@@ -1781,7 +1820,7 @@ app.post('/intercom/initialize', verifyIntercomRequest, async (req, res) => {
 
 app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
   try {
-    lastSubmit = req.body;
+    lastSubmit = { componentId: req.body.component_id, convId: req.body.conversation?.id, ts: new Date().toISOString() };
     console.log('SUBMIT component_id:', req.body.component_id);
 
     const componentId = req.body.component_id || '';
@@ -1815,9 +1854,8 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     // This works even when stored_data is empty — feedbackTitles comes from
     // the server-side conversation cache set during /initialize.
     const allArticles = await getArticles();
-    const storedSuggs = feedbackTitles
-      .map(title => allArticles.find(a => a.title === title))
-      .filter(Boolean);
+    const titleMap    = articleByTitle || new Map(allArticles.map(a => [a.title, a]));
+    const storedSuggs = feedbackTitles.map(t => titleMap.get(t)).filter(Boolean);
 
     const storedConvCtx = {
       text:      resolvedQuery,
