@@ -76,11 +76,22 @@ function getCachedConvSuggestions(convId) {
   return convId ? convSuggestionsCache.get(String(convId)) : null;
 }
 
-// --- Feedback log ---
-// In-memory ring buffer — persists across requests, resets on redeploy.
-// Exported via /debug/feedback for review and future training use.
+// --- Feedback log + training scores ---
+// feedbackLog: ring buffer of raw events for review/export.
+// articleFeedbackScores: aggregated per-article vote counts used to
+//   adjust suggestion scores in applyContextBoosts (training signal).
 const feedbackLog  = [];
 const FEEDBACK_MAX = 500;
+
+const articleFeedbackScores = {};  // { [title]: { ups, downs } }
+
+// Scoring constants for feedback multiplier (applied in applyContextBoosts):
+//   sentiment = (ups - downs) / (ups + downs + SMOOTHING)  → range ≈ -1…+1
+//   multiplier = clamp(1 + sentiment × MAX_EFFECT, MIN_MULT, ∞)
+// With SMOOTHING=5: ~5 votes needed for a 50% effect; 10+ votes for strong influence.
+const FEEDBACK_SMOOTHING  = 5;
+const FEEDBACK_MAX_EFFECT = 1.5;  // 2.5× boost at best, 0.05× floor at worst
+const FEEDBACK_MIN_MULT   = 0.05;
 
 // articleTitle: the specific article being rated
 // allTitles: all article titles shown in the same set (for context)
@@ -105,7 +116,16 @@ function recordFeedback(rating, articleTitle, convQuery, ctx, meta, allTitles) {
   };
   feedbackLog.push(entry);
   if (feedbackLog.length > FEEDBACK_MAX) feedbackLog.shift();
-  console.log(`FEEDBACK ${rating.toUpperCase()} | "${articleTitle}" | query="${convQuery.slice(0, 60)}"`);
+
+  // Update training scores — drives multiplier in applyContextBoosts
+  if (!articleFeedbackScores[articleTitle]) articleFeedbackScores[articleTitle] = { ups: 0, downs: 0 };
+  if (rating === 'up') articleFeedbackScores[articleTitle].ups++;
+  else                 articleFeedbackScores[articleTitle].downs++;
+
+  const s = articleFeedbackScores[articleTitle];
+  const sentiment = (s.ups - s.downs) / (s.ups + s.downs + FEEDBACK_SMOOTHING);
+  const mult = Math.max(FEEDBACK_MIN_MULT, 1 + sentiment * FEEDBACK_MAX_EFFECT).toFixed(2);
+  console.log(`FEEDBACK ${rating.toUpperCase()} | "${articleTitle}" | ups=${s.ups} downs=${s.downs} → mult=${mult}×`);
 }
 
 // --- Notion cache ---
@@ -1333,7 +1353,18 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
       if (title.includes('pixel'))                                     bonus -=  40;
     }
 
-    return { ...article, score: Math.max(0, article.score + bonus) };
+    const baseScore = Math.max(0, article.score + bonus);
+
+    // ── Step 5: feedback-trained multiplier ──────────────────────────────────
+    // Laplace-smoothed sentiment from agent 👍/👎 votes adjusts the score.
+    // Effect grows gradually: ~5 votes for 50% change, ~10 for strong influence.
+    const fb   = articleFeedbackScores[article.title];
+    const mult = fb
+      ? Math.max(FEEDBACK_MIN_MULT,
+          1 + ((fb.ups - fb.downs) / (fb.ups + fb.downs + FEEDBACK_SMOOTHING)) * FEEDBACK_MAX_EFFECT)
+      : 1.0;
+
+    return { ...article, score: baseScore * mult };
   })
     .sort((a, b) => b.score - a.score)
     .slice(0, 5);
@@ -1793,6 +1824,21 @@ app.use((err, req, res, next) => {
 });
 
 // Debug endpoints — protected by DEBUG_TOKEN env var
+app.get('/debug/training', requireDebugToken, (req, res) => {
+  // Show learned score multipliers for all rated articles
+  const rows = Object.entries(articleFeedbackScores).map(([title, s]) => {
+    const sentiment  = (s.ups - s.downs) / (s.ups + s.downs + FEEDBACK_SMOOTHING);
+    const multiplier = Math.max(FEEDBACK_MIN_MULT, 1 + sentiment * FEEDBACK_MAX_EFFECT);
+    return { title, ups: s.ups, downs: s.downs, total: s.ups + s.downs, multiplier: +multiplier.toFixed(3) };
+  }).sort((a, b) => b.multiplier - a.multiplier);
+
+  res.json({
+    constants: { FEEDBACK_SMOOTHING, FEEDBACK_MAX_EFFECT, FEEDBACK_MIN_MULT },
+    note: 'multiplier is applied to article score in applyContextBoosts. >1 boosts rank, <1 suppresses.',
+    articles: rows,
+  });
+});
+
 app.get('/debug/conv-cache',  requireDebugToken, (req, res) => {
   const entries = [];
   for (const [id, v] of convSuggestionsCache) entries.push({ id, titles: v.titles, ts: v.ts });
