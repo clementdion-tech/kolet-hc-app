@@ -76,22 +76,71 @@ function getCachedConvSuggestions(convId) {
   return convId ? convSuggestionsCache.get(String(convId)) : null;
 }
 
-// --- Feedback log + training scores ---
+// --- Feedback log + context-aware training scores ---
 // feedbackLog: ring buffer of raw events for review/export.
-// articleFeedbackScores: aggregated per-article vote counts used to
-//   adjust suggestion scores in applyContextBoosts (training signal).
+// articleFeedbackScores: per-article vote counts, split by context fingerprint
+//   so a 👎 on "Install eSIM" (eSIM already installed) doesn't penalise it
+//   for customers who haven't installed yet.
+//
+// Structure: { [title]: { global: {ups,downs}, ctx: { [fingerprint]: {ups,downs} } } }
 const feedbackLog  = [];
 const FEEDBACK_MAX = 500;
 
-const articleFeedbackScores = {};  // { [title]: { ups, downs } }
+const articleFeedbackScores = {};
 
-// Scoring constants for feedback multiplier (applied in applyContextBoosts):
-//   sentiment = (ups - downs) / (ups + downs + SMOOTHING)  → range ≈ -1…+1
+// Scoring constants for the Laplace-smoothed multiplier (applyContextBoosts):
+//   sentiment  = (ups - downs) / (ups + downs + SMOOTHING)  → range ≈ -1…+1
 //   multiplier = clamp(1 + sentiment × MAX_EFFECT, MIN_MULT, ∞)
-// With SMOOTHING=5: ~5 votes needed for a 50% effect; 10+ votes for strong influence.
+// SMOOTHING=5: ~5 votes for 50% effect; 10+ for strong influence.
+// MIN_CTX_VOTES: minimum votes in a context bucket before it overrides global.
 const FEEDBACK_SMOOTHING  = 5;
-const FEEDBACK_MAX_EFFECT = 1.5;  // 2.5× boost at best, 0.05× floor at worst
+const FEEDBACK_MAX_EFFECT = 1.5;
 const FEEDBACK_MIN_MULT   = 0.05;
+const FEEDBACK_MIN_CTX_VOTES = 2;  // need ≥2 context-specific votes to trust them
+
+// Build a compact fingerprint string from the current suggestion context.
+// Used to store / look up context-specific feedback votes.
+function buildContextFingerprint(ctx, meta, query) {
+  const parts = [];
+
+  if (ctx) {
+    // eSIM state (coarsened to 3 buckets)
+    const uninstalled = /uninstalled|not_installed|deleted/.test(ctx.esimStatus || '');
+    const installed   = !uninstalled && /installed|enabled|active/.test(ctx.esimStatus || '');
+    const disabled    = /disabled/.test(ctx.esimStatus || '');
+    if (uninstalled)       parts.push('esim:off');
+    else if (installed)    parts.push('esim:on');
+    else if (disabled)     parts.push('esim:dis');
+
+    if (ctx.partnerSlug)        parts.push(`partner:${ctx.partnerSlug}`);
+    if (ctx.isB2B)              parts.push('b2b');
+    if (ctx.fraudSuspected)     parts.push('fraud');
+    if (ctx.isRestrictedCountry) parts.push('geo:restricted');
+    if (ctx.dataExpired)        parts.push('data:expired');
+    if (ctx.dataNeverUsed && installed) parts.push('data:never_used');
+  }
+
+  // Intents from the conversation text + inbox + tags
+  const signalText = [
+    query                        || '',
+    meta?.inbox_name             || '',
+    (meta?.tags || []).join(' '),
+  ].join(' ').trim();
+  if (signalText) {
+    const intents = detectIntents(signalText);
+    if (intents.size) parts.push(`i:${[...intents].sort().join(',')}`);
+  }
+
+  return parts.sort().join('|') || 'generic';
+}
+
+function feedbackSentimentMultiplier(votes) {
+  if (!votes) return 1.0;
+  const total = votes.ups + votes.downs;
+  if (total === 0) return 1.0;
+  const sentiment = (votes.ups - votes.downs) / (total + FEEDBACK_SMOOTHING);
+  return Math.max(FEEDBACK_MIN_MULT, 1 + sentiment * FEEDBACK_MAX_EFFECT);
+}
 
 // articleTitle: the specific article being rated
 // allTitles: all article titles shown in the same set (for context)
@@ -117,15 +166,25 @@ function recordFeedback(rating, articleTitle, convQuery, ctx, meta, allTitles) {
   feedbackLog.push(entry);
   if (feedbackLog.length > FEEDBACK_MAX) feedbackLog.shift();
 
-  // Update training scores — drives multiplier in applyContextBoosts
-  if (!articleFeedbackScores[articleTitle]) articleFeedbackScores[articleTitle] = { ups: 0, downs: 0 };
-  if (rating === 'up') articleFeedbackScores[articleTitle].ups++;
-  else                 articleFeedbackScores[articleTitle].downs++;
+  // Update context-aware training scores
+  if (!articleFeedbackScores[articleTitle])
+    articleFeedbackScores[articleTitle] = { global: { ups: 0, downs: 0 }, ctx: {} };
 
-  const s = articleFeedbackScores[articleTitle];
-  const sentiment = (s.ups - s.downs) / (s.ups + s.downs + FEEDBACK_SMOOTHING);
-  const mult = Math.max(FEEDBACK_MIN_MULT, 1 + sentiment * FEEDBACK_MAX_EFFECT).toFixed(2);
-  console.log(`FEEDBACK ${rating.toUpperCase()} | "${articleTitle}" | ups=${s.ups} downs=${s.downs} → mult=${mult}×`);
+  const scores      = articleFeedbackScores[articleTitle];
+  const fingerprint = buildContextFingerprint(ctx, meta, convQuery);
+
+  // Increment global bucket (broad signal across all contexts)
+  if (rating === 'up') scores.global.ups++;
+  else                 scores.global.downs++;
+
+  // Increment context-specific bucket (precise signal for THIS context)
+  if (!scores.ctx[fingerprint]) scores.ctx[fingerprint] = { ups: 0, downs: 0 };
+  if (rating === 'up') scores.ctx[fingerprint].ups++;
+  else                 scores.ctx[fingerprint].downs++;
+
+  const ctxMult  = feedbackSentimentMultiplier(scores.ctx[fingerprint]).toFixed(2);
+  const globMult = feedbackSentimentMultiplier(scores.global).toFixed(2);
+  console.log(`FEEDBACK ${rating.toUpperCase()} | "${articleTitle}" | ctx="${fingerprint}" | ctx_mult=${ctxMult}× global_mult=${globMult}×`);
 }
 
 // --- Notion cache ---
@@ -1267,6 +1326,13 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
     combined.push(...injected.filter(a => !scored.some(s => s.url === a.url)));
   }
 
+  // Pre-compute context fingerprint once (used in Step 5 for feedback multiplier)
+  const ctxFingerprint = buildContextFingerprint(
+    ctx,
+    convCtx ? { inbox_name: convCtx.inboxName, tags: convCtx.tags } : {},
+    convCtx?.text || ''
+  );
+
   return combined.map(article => {
     let bonus = 0;
     const title    = article.title.toLowerCase();
@@ -1355,14 +1421,18 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
 
     const baseScore = Math.max(0, article.score + bonus);
 
-    // ── Step 5: feedback-trained multiplier ──────────────────────────────────
-    // Laplace-smoothed sentiment from agent 👍/👎 votes adjusts the score.
-    // Effect grows gradually: ~5 votes for 50% change, ~10 for strong influence.
+    // ── Step 5: context-aware feedback multiplier ─────────────────────────────
+    // Context-specific votes take priority (if ≥ MIN_CTX_VOTES).
+    // Falls back to global votes, then 1.0 (no adjustment).
     const fb   = articleFeedbackScores[article.title];
-    const mult = fb
-      ? Math.max(FEEDBACK_MIN_MULT,
-          1 + ((fb.ups - fb.downs) / (fb.ups + fb.downs + FEEDBACK_SMOOTHING)) * FEEDBACK_MAX_EFFECT)
-      : 1.0;
+    let   mult = 1.0;
+    if (fb) {
+      const ctxVotes = fb.ctx?.[ctxFingerprint];
+      const votes    = (ctxVotes && ctxVotes.ups + ctxVotes.downs >= FEEDBACK_MIN_CTX_VOTES)
+        ? ctxVotes   // enough context-specific data → use it
+        : fb.global; // fall back to global signal
+      mult = feedbackSentimentMultiplier(votes);
+    }
 
     return { ...article, score: baseScore * mult };
   })
@@ -1825,17 +1895,25 @@ app.use((err, req, res, next) => {
 
 // Debug endpoints — protected by DEBUG_TOKEN env var
 app.get('/debug/training', requireDebugToken, (req, res) => {
-  // Show learned score multipliers for all rated articles
-  const rows = Object.entries(articleFeedbackScores).map(([title, s]) => {
-    const sentiment  = (s.ups - s.downs) / (s.ups + s.downs + FEEDBACK_SMOOTHING);
-    const multiplier = Math.max(FEEDBACK_MIN_MULT, 1 + sentiment * FEEDBACK_MAX_EFFECT);
-    return { title, ups: s.ups, downs: s.downs, total: s.ups + s.downs, multiplier: +multiplier.toFixed(3) };
-  }).sort((a, b) => b.multiplier - a.multiplier);
+  const articles = Object.entries(articleFeedbackScores).map(([title, s]) => {
+    const globalMult = +feedbackSentimentMultiplier(s.global).toFixed(3);
+    const contexts   = Object.entries(s.ctx || {}).map(([fp, v]) => ({
+      fingerprint: fp,
+      ups:         v.ups,
+      downs:       v.downs,
+      multiplier:  +feedbackSentimentMultiplier(v).toFixed(3),
+    })).sort((a, b) => b.ups + b.downs - (a.ups + a.downs));
+    return {
+      title,
+      global:   { ups: s.global.ups, downs: s.global.downs, multiplier: globalMult },
+      contexts,
+    };
+  }).sort((a, b) => (b.global.ups + b.global.downs) - (a.global.ups + a.global.downs));
 
   res.json({
-    constants: { FEEDBACK_SMOOTHING, FEEDBACK_MAX_EFFECT, FEEDBACK_MIN_MULT },
-    note: 'multiplier is applied to article score in applyContextBoosts. >1 boosts rank, <1 suppresses.',
-    articles: rows,
+    constants: { FEEDBACK_SMOOTHING, FEEDBACK_MAX_EFFECT, FEEDBACK_MIN_MULT, FEEDBACK_MIN_CTX_VOTES },
+    note: 'Context-specific multiplier overrides global when ≥ MIN_CTX_VOTES votes exist for the same fingerprint.',
+    articles,
   });
 });
 
