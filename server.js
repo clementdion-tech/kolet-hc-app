@@ -27,6 +27,13 @@ function notionFetch(url, opts = {}) {
   return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
 }
 
+// Intercom REST API can take 5-15s under load — use a longer timeout than notionFetch
+function intercomFetch(url, opts = {}) {
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 25_000);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
+
 const app = express();
 // Trust Render's reverse proxy so express-rate-limit reads the real client IP from X-Forwarded-For
 app.set('trust proxy', 1);
@@ -275,8 +282,8 @@ function recordFeedback(rating, articleTitle, convQuery, ctx, meta, allTitles) {
     rated_article:  articleTitle,
     other_articles: allTitles.filter(t => t !== articleTitle),
     conv_query:     convQuery,
-    inbox_name:     meta.inbox_name || '',
-    tags:           meta.tags       || [],
+    inbox_name:     meta?.inbox_name || '',
+    tags:           meta?.tags       || [],
     ctx_signals:    ctx ? {
       esimStatus:      ctx.esimStatus      || null,
       partnerSlug:     ctx.partnerSlug     || null,
@@ -459,6 +466,8 @@ async function _fetchArticles() {
   const results = [];
   let cursor = undefined;
 
+  let _page = 0;
+  const MAX_PAGES = 20;
   do {
     const body = { page_size: 100 };
     if (cursor) body.start_cursor = cursor;
@@ -499,7 +508,7 @@ async function _fetchArticles() {
       });
     }
 
-    cursor = data.has_more ? data.next_cursor : undefined;
+    cursor = (data.has_more && ++_page < MAX_PAGES) ? data.next_cursor : undefined;
   } while (cursor);
 
   articleCache   = results;
@@ -1932,6 +1941,10 @@ function searchInputComponents() {
 // searchSection: { query, results } — when present, appended below suggestions.
 //                Suggestions are ALWAYS visible; search results are additive.
 function buildSuggestionsCanvas(articles, convCtx, ctx, ratedMap = {}, searchSection = null) {
+  // Cap at 4 articles — 5 with hints+feedback+category = 36 components (over Canvas Kit ~30 limit)
+  // 4 articles × 6 components + 6 fixed = 30 max
+  const cappedArticles = articles.slice(0, 4);
+  articles = cappedArticles;
   const contextLabel = buildConvContextLabel(convCtx);
 
   const components = [
@@ -2263,15 +2276,15 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
         const headers = { Authorization: `Bearer ${token}`, Accept: 'application/json' };
 
         // Fetch conversation (messages) and contact (eSIM, device, partner, plan…) in parallel
-        const convRes = await notionFetch(`https://api.intercom.io/conversations/${convId}`, { headers });
+        const convRes = await intercomFetch(`https://api.intercom.io/conversations/${convId}`, { headers });
         if (!convRes.ok) throw new Error(`Intercom conv API ${convRes.status}`);
         const freshBody = await convRes.json();
 
         // Get contact ID from conversation then fetch full contact with all custom_attributes
         const contactId = freshBody.contacts?.contacts?.[0]?.id;
         let freshContact = {};
-        if (contactId) {
-          const contactRes = await notionFetch(`https://api.intercom.io/contacts/${contactId}`, { headers });
+        if (contactId != null && contactId !== '') {
+          const contactRes = await intercomFetch(`https://api.intercom.io/contacts/${contactId}`, { headers });
           if (contactRes.ok) freshContact = await contactRes.json();
         }
 
@@ -2337,7 +2350,8 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
   } catch (err) {
     lastError = { route: 'submit', message: err.message, stack: err.stack, time: new Date().toISOString() };
     console.error('SUBMIT ERROR:', err.message, err.stack);
-    return res.json(buildErrorCanvas());
+    // Return searchOnlyCanvas (not error canvas) so agent can still search even if suggestions fail
+    return res.json(searchOnlyCanvas);
   }
 });
 
@@ -2484,7 +2498,7 @@ app.get('/health', (req, res) => res.json({ ok: true, cached: articleCache?.leng
     await getArticles();
   } catch (err) {
     console.error('Cache warm failed:', err.message, '— retrying in 30s');
-    setTimeout(warmCache, 30_000);
+    if (!articleCache) setTimeout(warmCache, 30_000);
   }
 })();
 
