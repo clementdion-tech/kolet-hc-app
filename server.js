@@ -112,7 +112,6 @@ const CONV_CACHE_MAX = 2000;
 
 // --- Server-side search results cache ---
 // Intercom does NOT reliably send stored_data on button clicks.
-// We cache the last search state per conversation so feedback votes work.
 const convSearchCache = new Map();
 
 function cacheConvSearch(convId, query, articleTitles) {
@@ -130,6 +129,47 @@ function getCachedConvSearch(convId) {
   if (Date.now() - entry.ts > 24 * 60 * 60 * 1000) { convSearchCache.delete(String(convId)); return null; }
   return entry;
 }
+
+// --- Learned injections: search clicks feed back into suggestions ---
+// When an agent clicks a search result, that article is injected into future
+// suggestions for conversations with the same context fingerprint.
+// Structure: Map<fingerprint, Map<articleTitle, hitCount>>
+const learnedInjections = new Map();
+const LEARNED_INJECT_BASE  = 420; // base score per click — above standard context injections (~300-330)
+const LEARNED_INJECT_PER   = 20;  // +20 per additional click (5 clicks = 500, beats esim:on bonuses ~480)
+
+function recordLearnedInjection(ctx, articleTitle) {
+  const fp = buildContextFingerprint(ctx);
+  if (!learnedInjections.has(fp)) learnedInjections.set(fp, new Map());
+  const fpMap = learnedInjections.get(fp);
+  fpMap.set(articleTitle, (fpMap.get(articleTitle) || 0) + 1);
+}
+
+function saveLearnedInjections() {
+  const data = {};
+  for (const [fp, articles] of learnedInjections) {
+    data[fp] = Object.fromEntries(articles);
+  }
+  const tmp = path.join(__dirname, 'data', 'learned.json.tmp');
+  const dest = path.join(__dirname, 'data', 'learned.json');
+  fs.mkdir(path.join(__dirname, 'data'), { recursive: true }, () => {
+    fs.writeFile(tmp, JSON.stringify(data), 'utf8', err => {
+      if (!err) fs.rename(tmp, dest, () => {});
+    });
+  });
+}
+
+function loadLearnedInjections() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(path.join(__dirname, 'data', 'learned.json'), 'utf8'));
+    for (const [fp, articles] of Object.entries(saved)) {
+      learnedInjections.set(fp, new Map(Object.entries(articles)));
+    }
+    console.log(`Loaded learned injections for ${learnedInjections.size} contexts`);
+  } catch { /* absent on first run */ }
+}
+
+loadLearnedInjections();
 
 function cacheConvSuggestions(convId, titles, convQuery, ctx, meta) {
   if (!convId) return;
@@ -1535,11 +1575,19 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
     if (intents.has(intent)) inject(allArticles, filterFn, score);
   }
 
+  // ── Step 6: inject articles learned from agent search clicks ─────────────
+  // Must run BEFORE combined is built so learned articles enter the array.
+  // Uses ctx-only fingerprint: "REFUNDS clicked for esim:on" applies to all
+  // future esim:on conversations regardless of the current topic.
+  const learnedFp = ctx ? buildContextFingerprint(ctx) : null;
+  const learned   = learnedFp ? learnedInjections.get(learnedFp) : null;
+  if (learned) {
+    inject(allArticles, a => learned.has(a.title), LEARNED_INJECT_BASE);
+  }
+
   const combined = [...scored, ...injected];
 
   // ── Step 4: eSIM-state fallback (never return empty for eSIM-related convos) ──
-  // Fires when: no results yet AND (we have an eSIM status OR we have conversation text).
-  // Leads (no custom_attributes) have empty esimStatus but still have conversation text.
   if (combined.length === 0 && (ctx?.esimStatus || convCtx?.text)) {
     if (esimInstalled) {
       inject(allArticles, a => {
@@ -1554,8 +1602,6 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
     combined.push(...injected.filter(a => !scored.some(s => s.url === a.url)));
   }
 
-  // Pre-compute context fingerprint once (used in Step 5 for feedback multiplier)
-  // Pass the already-computed intents Set to avoid re-running detectIntents
   const ctxFingerprint = buildContextFingerprint(
     ctx,
     convCtx ? { inbox_name: convCtx.inboxName, tags: convCtx.tags } : {},
@@ -1664,7 +1710,15 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
       mult = feedbackSentimentMultiplier(votes);
     }
 
-    return { ...article, score: baseScore * mult };
+    // Step 6 score override: boost learned articles above contextual noise.
+    // Score scales with click count: 1 click → 420+20=440, 5 clicks → 520, etc.
+    let finalScore = baseScore * mult;
+    if (learned?.has(article.title)) {
+      const hits = learned.get(article.title) || 1;
+      const learnedScore = LEARNED_INJECT_BASE + hits * LEARNED_INJECT_PER;
+      finalScore = Math.max(finalScore, learnedScore);
+    }
+    return { ...article, score: finalScore };
   })
     .sort((a, b) => b.score - a.score)
     .slice(0, 5);
@@ -1921,7 +1975,7 @@ const searchOnlyCanvas = {
 };
 
 // searchRated: { [idx]: 'up'|'down' } — per-result feedback state (for re-render after vote)
-function buildResultsCanvas(headerText, articles, convQuery, ctx, storedConvCtxMeta = {}, searchQuery = '', searchRated = {}) {
+function buildResultsCanvas(headerText, articles, convQuery, ctx, storedConvCtxMeta = {}, searchQuery = '', searchRated = {}, convId = '') {
   const hasSuggestions = Boolean(convQuery) || Boolean(ctx);
   const components = [
     ...searchInputComponents(),
@@ -1939,15 +1993,17 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx, storedConvCtxM
   if (articles.length === 0) {
     components.push({ type: 'text', text: 'No articles found.', style: 'muted' });
   } else {
-    // Render each result with per-article 👍/👎 feedback buttons
+    // Render each result with click-tracking URL and 👍/👎 feedback buttons
     for (let i = 0; i < articles.length; i++) {
-      const article = articles[i];
-      const hint    = getArticleHint(article, ctx);
+      const article   = articles[i];
+      const hint      = getArticleHint(article, ctx);
+      // Route through /track so clicks feed into the suggestion engine
+      const trackUrl  = `/track?conv=${encodeURIComponent(convId)}&idx=${i}`;
       components.push({ type: 'divider' });
       components.push({
         type: 'button', id: `result_${i}`,
         label: article.title, style: 'link',
-        action: { type: 'url', url: article.url },
+        action: { type: 'url', url: `${process.env.APP_URL || 'https://kolet-hc-app.onrender.com'}${trackUrl}` },
       });
       if (hint) components.push({ type: 'text', text: `⚡ ${hint}`, style: 'muted' });
       if (searchRated[i]) {
@@ -2170,7 +2226,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
       return res.json(buildResultsCanvas(
         `Results for "${searchQ}"`, resultArticles,
         resolvedQuery || null, resolvedCtx, resolvedMeta,
-        searchQ, newRated
+        searchQ, newRated, convId
       ));
     }
 
@@ -2206,7 +2262,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     // Always return a clean results-only canvas — the combined canvas (suggestions + results)
     // exceeded Canvas Kit's component limit (~20-30) causing silent render failure.
     // The ← Back button restores suggestions from the server-side cache.
-    return res.json(buildResultsCanvas(`Results for "${query}"`, searchResults, resolvedQuery || null, resolvedCtx, resolvedMeta, query));
+    return res.json(buildResultsCanvas(`Results for "${query}"`, searchResults, resolvedQuery || null, resolvedCtx, resolvedMeta, query, {}, convId));
 
   } catch (err) {
     lastError = { route: 'submit', message: err.message, stack: err.stack, time: new Date().toISOString() };
@@ -2304,6 +2360,40 @@ app.get('/debug/feedback', requireDebugToken, (req, res) => {
     article_stats: rankedArticles,
     entries: feedbackLog.slice().reverse(),
   });
+});
+
+// Article click tracking — records implicit positive feedback and feeds into suggestions.
+// Called when an agent clicks a search result article link.
+app.get('/track', async (req, res) => {
+  const convId     = String(req.query.conv || '').slice(0, 100);
+  const articleIdx = parseInt(req.query.idx || '0', 10);
+
+  const cachedSearch = getCachedConvSearch(convId);
+  if (!cachedSearch) return res.status(404).send('Session expired');
+
+  const articleTitle = cachedSearch.articleTitles[articleIdx];
+  if (!articleTitle) return res.status(404).send('Article not found');
+
+  // Look up URL from knowledge base (prevents open redirect)
+  const articles = await getArticles();
+  const tMap     = articleByTitle || new Map(articles.map(a => [a.title, a]));
+  const article  = tMap.get(articleTitle);
+  if (!article) return res.status(404).send('Article not in KB');
+
+  // Record as implicit positive feedback
+  const cachedConv = getCachedConvSuggestions(convId);
+  const ctx        = cachedConv?.ctx || null;
+  const meta       = cachedConv?.meta || {};
+  recordFeedback('up', articleTitle, cachedSearch.query, ctx, meta, cachedSearch.articleTitles);
+
+  // Inject into future suggestions for same contact context
+  if (ctx) {
+    recordLearnedInjection(ctx, articleTitle);
+    saveLearnedInjections();
+  }
+
+  console.log(`TRACK click | conv=${convId} | article="${articleTitle}" | query="${cachedSearch.query}"`);
+  res.redirect(302, article.url);
 });
 
 app.get('/health', (req, res) => res.json({ ok: true, cached: articleCache?.length || 0, enriched: articleCache?.filter(a => a.extractedKeywords).length || 0 }));
