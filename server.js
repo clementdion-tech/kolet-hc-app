@@ -1,6 +1,13 @@
 const express = require('express');
 const crypto  = require('crypto');
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
+const fs      = require('fs');
+const path    = require('path');
+let _fetchFn  = null;
+const fetch   = globalThis.fetch
+  ? (url, opts) => globalThis.fetch(url, opts)
+  : (...args) => (_fetchFn
+      ? _fetchFn(...args)
+      : import('node-fetch').then(({ default: fn }) => { _fetchFn = fn; return fn(...args); }));
 require('dotenv').config();
 
 const app = express();
@@ -189,11 +196,41 @@ function recordFeedback(rating, articleTitle, convQuery, ctx, meta, allTitles) {
 
 // --- Notion cache ---
 let articleCache   = null;
-let articleDfCache = null; // pre-computed IDF weights per word (built by buildDfCache)
-let articleByTitle = null; // Map<title, article> for O(1) title lookups
+let articleDfCache = null;
+let articleByTitle = null;
 let cacheExpiry    = 0;
-let cacheInflight  = null; // deduplicates concurrent fetches
+let cacheInflight  = null;
 const CACHE_TTL    = 5 * 60 * 1000;
+
+// --- Article cache persistence (eliminates cold-start spinning wheel) ---
+const ARTICLES_FILE = path.join(__dirname, 'data', 'articles.json');
+
+function saveArticleCache(articles) {
+  const slim = articles.map(a => ({
+    title: a.title, category: a.category, keywords: a.keywords,
+    extractedKeywords: a.extractedKeywords, url: a.url, pageId: a.pageId,
+    _titleLC: a._titleLC, _categoryLC: a._categoryLC, _haystack: a._haystack,
+  }));
+  const tmp = ARTICLES_FILE + '.tmp';
+  fs.mkdir(path.join(__dirname, 'data'), { recursive: true }, () => {
+    fs.writeFile(tmp, JSON.stringify(slim), 'utf8', err => {
+      if (!err) fs.rename(tmp, ARTICLES_FILE, () => {});
+    });
+  });
+}
+
+function loadArticleCache() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(ARTICLES_FILE, 'utf8'));
+    if (!Array.isArray(saved) || saved.length === 0) return;
+    articleCache   = saved.map(a => ({ ...a, content: '' }));
+    articleByTitle = new Map(articleCache.map(a => [a.title, a]));
+    cacheExpiry    = Date.now(); // stale — background refresh on first request
+    console.log(`Loaded ${articleCache.length} articles from disk cache`);
+  } catch { /* file absent on first run */ }
+}
+
+loadArticleCache();
 
 // Recursively fetch all block text up to MAX_DEPTH levels (handles toggles, callouts, lists, tables)
 const MAX_BLOCK_DEPTH = 3;
@@ -251,15 +288,16 @@ async function fetchBlocksText(blockId, depth = 0) {
 }
 
 async function getArticles() {
-  if (articleCache && Date.now() < cacheExpiry) return articleCache;
-  // If a fetch is already in progress, wait for it rather than launching a second one
+  // Stale-while-revalidate: serve cached data immediately, refresh Notion in background.
+  // Prevents blocking requests on Notion fetch → eliminates Intercom spinning wheel.
+  if (articleCache) {
+    if (Date.now() >= cacheExpiry && !cacheInflight) {
+      cacheInflight = _fetchArticles().finally(() => { cacheInflight = null; });
+    }
+    return articleCache;
+  }
+  // No cache at all (first cold start) — must wait
   if (cacheInflight) return cacheInflight;
-
-  // Clear derived caches so stale data isn't used during refresh
-  articleCache   = null;
-  articleDfCache = null;
-  articleByTitle = null;
-
   cacheInflight = _fetchArticles().finally(() => { cacheInflight = null; });
   return cacheInflight;
 }
@@ -317,7 +355,12 @@ async function _fetchArticles() {
       const pageId = page.id.replace(/-/g, '');
       const url = `https://www.notion.so/kolet/${pageId}`;
 
-      results.push({ title, category, keywords, content: '', extractedKeywords: '', url, pageId: page.id });
+      const _titleLC    = title.toLowerCase();
+      const _categoryLC = category.toLowerCase();
+      results.push({ title, category, keywords, content: '', extractedKeywords: '',
+        url, pageId: page.id, _titleLC, _categoryLC,
+        _haystack: `${_titleLC} ${_categoryLC} ${keywords}`,
+      });
     }
 
     cursor = data.has_more ? data.next_cursor : undefined;
@@ -329,8 +372,10 @@ async function _fetchArticles() {
   cacheExpiry    = Date.now() + CACHE_TTL;
   console.log(`Cached ${results.length} articles`);
 
+  saveArticleCache(results);
+
   // Fetch page content in background (3 at a time, 300ms gap to avoid rate limits)
-  enrichArticleContent(results);
+  enrichArticleContent(results).catch(err => console.error('Enrichment failed:', err.message));
 
   return results;
 }
@@ -1275,13 +1320,12 @@ function getArticleHint(article, ctx) {
 }
 
 function applyContextBoosts(allArticles, scored, ctx, convCtx) {
-  if (!ctx) return scored.slice(0, 5);
+  if (!ctx && !convCtx) return scored.slice(0, 5);
 
-  // Check uninstalled/not-installed FIRST, then installed — avoids "uninstalled".includes("installed")
-  const esimUninstalled = /uninstalled|not_installed|deleted/.test(ctx.esimStatus);
-  const esimInstalled   = !esimUninstalled && /installed|enabled|active/.test(ctx.esimStatus);
-  const esimDisabled    = /disabled/.test(ctx.esimStatus);
-  const neverConnected  = esimInstalled && ctx.esimLastCountry === null;
+  const esimUninstalled = ctx ? /uninstalled|not_installed|deleted/.test(ctx.esimStatus) : false;
+  const esimInstalled   = ctx ? !esimUninstalled && /installed|enabled|active/.test(ctx.esimStatus) : false;
+  const esimDisabled    = ctx ? /disabled/.test(ctx.esimStatus) : false;
+  const neverConnected  = esimInstalled && ctx?.esimLastCountry === null;
 
   // Force-inject articles for strong context signals even when text score = 0
   const scoredUrls = new Set(scored.map(a => a.url));
@@ -1293,19 +1337,19 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
   }
 
   // ── Step 1: hard contact-attribute signals ────────────────────────────────
-  if (ctx.partnerKeyword) {
-    inject(allArticles, a => a.title.toLowerCase().includes(ctx.partnerKeyword), 250);
+  if (ctx?.partnerKeyword) {
+    inject(allArticles, a => a.title.toLowerCase().includes(ctx?.partnerKeyword), 250);
   }
-  if (ctx.fraudSuspected) {
+  if (ctx?.fraudSuspected) {
     inject(allArticles, a => a.category.toLowerCase().includes('fraud'), 200);
   }
-  if (ctx.esimCompatible === false) {
+  if (ctx?.esimCompatible === false) {
     inject(allArticles, a => {
       const t = a.title.toLowerCase();
       return t.includes('adapter') || t.includes('compatible');
     }, 220);
   }
-  if (ctx.isRestrictedCountry) {
+  if (ctx?.isRestrictedCountry) {
     inject(allArticles, a => {
       const t = a.title.toLowerCase();
       return t.includes('egyptian') || t.includes('turkish') ||
@@ -1313,13 +1357,13 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
              t.includes('constraint');
     }, 230);
   }
-  if (ctx.hasFlyingBlue) {
+  if (ctx?.hasFlyingBlue) {
     inject(allArticles, a => {
       const t = a.title.toLowerCase();
       return t.includes('air france') || t.includes('flying blue');
     }, 210);
   }
-  if (ctx.isB2B) {
+  if (ctx?.isB2B) {
     inject(allArticles, a => {
       const t = a.title.toLowerCase();
       return t.includes('b2b') || t.includes('business');
@@ -1349,7 +1393,7 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
   // ── Step 4: eSIM-state fallback (never return empty for eSIM-related convos) ──
   // Fires when: no results yet AND (we have an eSIM status OR we have conversation text).
   // Leads (no custom_attributes) have empty esimStatus but still have conversation text.
-  if (combined.length === 0 && (ctx.esimStatus || convCtx?.text)) {
+  if (combined.length === 0 && (ctx?.esimStatus || convCtx?.text)) {
     if (esimInstalled) {
       inject(allArticles, a => {
         const cat = a.category.toLowerCase();
@@ -1357,7 +1401,7 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
         return cat.includes('connect') || cat.includes('start using') ||
                t.includes('find') || t.includes('locat') || t.includes('constraint');
       }, 120);
-    } else if (esimUninstalled || !ctx.esimIccid) {
+    } else if (esimUninstalled || !ctx?.esimIccid) {
       inject(allArticles, a => a.category.toLowerCase().includes('install'), 120);
     }
     combined.push(...injected.filter(a => !scored.some(s => s.url === a.url)));
@@ -1396,7 +1440,7 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
     }
 
     // --- Data never used (plan exists but 0 bytes consumed) ---
-    if (ctx.dataNeverUsed && esimInstalled) {
+    if (ctx?.dataNeverUsed && esimInstalled) {
       if (category.includes('start using'))                            bonus += 120;
       if (title.includes('apn'))                                       bonus += 100;
       if (title.includes('activate') || title.includes('connect'))     bonus +=  80;
@@ -1410,51 +1454,51 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
     }
 
     // --- Multiple installs → reassignment/transfer articles ---
-    if (ctx.esimInstallCount > 1) {
+    if (ctx?.esimInstallCount > 1) {
       if (title.includes('reassign') || title.includes('move') || title.includes('transfer')) bonus += 80;
     }
 
     // --- Data expired ---
-    if (ctx.dataExpired) {
+    if (ctx?.dataExpired) {
       if (title.includes('extend') || title.includes('renew'))         bonus += 100;
       if (category.includes('money'))                                  bonus +=  40;
     }
 
     // --- Restricted country ---
-    if (ctx.isRestrictedCountry) {
+    if (ctx?.isRestrictedCountry) {
       if (title.includes('egyptian') || title.includes('turkish') ||
           (title.includes('blocked') && title.includes('government'))) bonus += 230;
       if (title.includes('constraint'))                                bonus += 150;
     }
 
     // --- Partner ---
-    if (ctx.partnerKeyword) {
-      if (title.includes(ctx.partnerKeyword))                          bonus += 250;
+    if (ctx?.partnerKeyword) {
+      if (title.includes(ctx?.partnerKeyword))                          bonus += 250;
       else if (category.includes('travel partner'))                    bonus +=  40;
     }
 
     // --- Flying Blue ---
-    if (ctx.hasFlyingBlue) {
+    if (ctx?.hasFlyingBlue) {
       if (title.includes('air france') || title.includes('flying blue') ||
           title.includes('afklm'))                                     bonus += 200;
       if (title.includes('miles') || title.includes('points'))        bonus +=  80;
     }
 
     // --- Fraud ---
-    if (ctx.fraudSuspected) {
+    if (ctx?.fraudSuspected) {
       if (category.includes('fraud'))                                  bonus += 200;
     }
 
     // --- B2B ---
-    if (ctx.isB2B) {
+    if (ctx?.isB2B) {
       if (title.includes('b2b') || title.includes('business'))        bonus += 180;
     }
 
     // --- Device specifics ---
-    if (ctx.isAndroid) {
+    if (ctx?.isAndroid) {
       if (title.includes('pixel') || title.includes('android'))       bonus +=  60;
     }
-    if (ctx.isIOS) {
+    if (ctx?.isIOS) {
       if (title.includes('pixel'))                                     bonus -=  40;
     }
 
@@ -1927,7 +1971,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     }
 
     const searchRaw     = searchArticles(allArticles, query);
-    const searchResults = applyContextBoosts(allArticles, searchRaw, resolvedCtx);
+    const searchResults = applyContextBoosts(allArticles, searchRaw, resolvedCtx, storedConvCtx);
     console.log(`Found ${searchResults.length} for "${query}"`);
 
     if (storedSuggs.length > 0) {
