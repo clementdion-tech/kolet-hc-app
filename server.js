@@ -2122,7 +2122,9 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     }
 
     const searchRaw     = searchArticlesRRF(allArticles, query);
-    const searchResults = applyContextBoosts(allArticles, searchRaw, resolvedCtx, storedConvCtx);
+    // For manual search: do NOT apply context boosts — contact signals (eSIM status,
+    // partner, etc.) must not override an explicit query. Return top 5 by search score.
+    const searchResults = searchRaw.slice(0, 5);
     console.log(`Found ${searchResults.length} for "${query}"`);
 
     // Always return a clean results-only canvas — the combined canvas (suggestions + results)
