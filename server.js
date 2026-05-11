@@ -937,11 +937,22 @@ function expandTerms(words, fullQuery) {
 //
 const FIELD_BOOSTS = { title: 10, category: 3, keywords: 5, extkw: 2, content: 1 };
 
-// Score a single (term, field) pair with IDF weighting.
-// Multi-word phrases score ×2 — they are more specific than unigrams.
+// Count non-overlapping occurrences of term in text (fast indexOf loop)
+function countOccurrences(text, term) {
+  let n = 0, pos = 0;
+  while ((pos = text.indexOf(term, pos)) !== -1) { n++; pos += term.length; }
+  return n;
+}
+
+// BM25-style TF-IDF field scoring.
+// TF saturation (k1=1.5): a term appearing 3× scores ~2.2× vs 1×, not 3×.
+// Multi-word phrases score ×2 — more specific than unigrams.
+const BM25_K1 = 1.5;
 function scoreFieldIDF(text, term, idfWeight, fieldBoost) {
   if (!text || !text.includes(term)) return 0;
-  return idfWeight * fieldBoost * (term.includes(' ') ? 2 : 1);
+  const tf   = countOccurrences(text, term);
+  const tfBM = (tf * (BM25_K1 + 1)) / (tf + BM25_K1);
+  return idfWeight * fieldBoost * tfBM * (term.includes(' ') ? 2 : 1);
 }
 
 // Compute smoothed IDF for each raw query term against the article corpus.
@@ -964,6 +975,22 @@ function computeQueryIDF(articles, rawTerms) {
     }
   }
   return weights;
+}
+
+// Reciprocal Rank Fusion — merges multiple ranked lists.
+// RRF(d) = Σ 1/(k + rank_i(d))  — standard k=60
+// Used to combine the raw query pass with synonym-expanded variant passes.
+function reciprocalRankFusion(rankedLists, k = 60) {
+  const scores = new Map();
+  for (const list of rankedLists) {
+    list.forEach((article, rank) => {
+      const prev = scores.get(article.url) || { article, score: 0 };
+      scores.set(article.url, { article, score: prev.score + 1 / (k + rank + 1) });
+    });
+  }
+  return [...scores.values()]
+    .sort((a, b) => b.score - a.score)
+    .map(({ article }) => article);
 }
 
 function searchArticles(articles, rawQuery) {
@@ -1084,6 +1111,44 @@ function searchArticles(articles, rawQuery) {
   return scored
     .filter(a => a.score > 0)
     .sort((a, b) => b.score - a.score);
+}
+
+// Multi-query search with Reciprocal Rank Fusion.
+// Runs the raw query + up to 2 synonym-expanded variants, merges with RRF.
+// This catches vocabulary mismatches ("cancel" → "refund", "slow" → "throttled").
+function searchArticlesRRF(articles, rawQuery) {
+  const q = sanitizeQuery(rawQuery);
+  if (!q) return [];
+
+  // Pass 1: raw query
+  const pass1 = searchArticles(articles, rawQuery);
+
+  // Generate variant queries from top synonym keys that match the query
+  const variantQueries = new Set();
+  for (const [key, syns] of Object.entries(SYNONYMS)) {
+    if (q.includes(key) || syns.some(s => q.includes(s))) {
+      // Build a variant query using the canonical key
+      variantQueries.add(key);
+      // And the first multi-word synonym phrase if any
+      const phrase = syns.find(s => s.includes(' '));
+      if (phrase) variantQueries.add(phrase);
+    }
+  }
+
+  const passes = [pass1];
+  let count = 0;
+  for (const variant of variantQueries) {
+    if (count >= 2) break; // max 2 extra passes
+    if (variant !== q) {
+      const results = searchArticles(articles, variant);
+      if (results.length > 0) { passes.push(results); count++; }
+    }
+  }
+
+  // Single pass — no need for RRF merge
+  if (passes.length === 1) return pass1;
+
+  return reciprocalRankFusion(passes);
 }
 
 // Maps Intercom partner slugs to keywords found in article titles
@@ -2056,7 +2121,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
       return res.json(searchOnlyCanvas);
     }
 
-    const searchRaw     = searchArticles(allArticles, query);
+    const searchRaw     = searchArticlesRRF(allArticles, query);
     const searchResults = applyContextBoosts(allArticles, searchRaw, resolvedCtx, storedConvCtx);
     console.log(`Found ${searchResults.length} for "${query}"`);
 
