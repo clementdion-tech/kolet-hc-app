@@ -270,12 +270,13 @@ function feedbackSentimentMultiplier(votes) {
 // allTitles: all article titles shown in the same set (for context)
 // Push one row to the Google Sheet (fire-and-forget, never blocks a response)
 function pushToSheet(row) {
-  const url = process.env.GSHEET_WEBHOOK_URL;
+  const url    = process.env.GSHEET_WEBHOOK_URL;
+  const secret = process.env.GSHEET_SECRET;
   if (!url) return;
   fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(row),
+    body: JSON.stringify({ ...row, secret: secret || '' }),
   }).catch(err => console.warn('GSheet push failed:', err.message));
 }
 
