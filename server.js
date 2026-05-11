@@ -2477,6 +2477,15 @@ app.get('/track', async (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true, cached: articleCache?.length || 0, enriched: articleCache?.filter(a => a.extractedKeywords).length || 0 }));
 
-getArticles().catch(err => console.error('Cache warm failed:', err.message));
+// Warm article cache on startup. On failure (Notion rate limit etc.), retry every 30s
+// so the tool recovers automatically without needing a redeploy.
+(async function warmCache() {
+  try {
+    await getArticles();
+  } catch (err) {
+    console.error('Cache warm failed:', err.message, '— retrying in 30s');
+    setTimeout(warmCache, 30_000);
+  }
+})();
 
 app.listen(process.env.PORT || 3000, () => console.log('KokoBrain app running'));
