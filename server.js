@@ -137,26 +137,38 @@ function getCachedConvSearch(convId) {
 const learnedInjections = new Map();
 const LEARNED_INJECT_BASE  = 420; // base score per click — above standard context injections (~300-330)
 const LEARNED_INJECT_PER   = 20;  // +20 per additional click (5 clicks = 500, beats esim:on bonuses ~480)
+const LEARNED_MAX_FPS      = 500; // max distinct context fingerprints
+const LEARNED_MAX_ARTS     = 50;  // max articles per fingerprint
 
 function recordLearnedInjection(ctx, articleTitle) {
   const fp = buildContextFingerprint(ctx);
-  if (!learnedInjections.has(fp)) learnedInjections.set(fp, new Map());
+  if (!learnedInjections.has(fp)) {
+    if (learnedInjections.size >= LEARNED_MAX_FPS) return; // cap fingerprint space
+    learnedInjections.set(fp, new Map());
+  }
   const fpMap = learnedInjections.get(fp);
+  if (!fpMap.has(articleTitle) && fpMap.size >= LEARNED_MAX_ARTS) return; // cap per fingerprint
   fpMap.set(articleTitle, (fpMap.get(articleTitle) || 0) + 1);
 }
 
+// Debounced save — coalesces rapid clicks into one write (2s window)
+let _saveLearnedTimer = null;
 function saveLearnedInjections() {
-  const data = {};
-  for (const [fp, articles] of learnedInjections) {
-    data[fp] = Object.fromEntries(articles);
-  }
-  const tmp = path.join(__dirname, 'data', 'learned.json.tmp');
-  const dest = path.join(__dirname, 'data', 'learned.json');
-  fs.mkdir(path.join(__dirname, 'data'), { recursive: true }, () => {
+  clearTimeout(_saveLearnedTimer);
+  _saveLearnedTimer = setTimeout(() => {
+    const data = {};
+    for (const [fp, articles] of learnedInjections) {
+      data[fp] = Object.fromEntries(articles);
+    }
+    const tmp  = path.join(__dirname, 'data', 'learned.json.tmp');
+    const dest = path.join(__dirname, 'data', 'learned.json');
     fs.writeFile(tmp, JSON.stringify(data), 'utf8', err => {
-      if (!err) fs.rename(tmp, dest, () => {});
+      if (err) { console.error('Failed to save learned injections:', err.message); return; }
+      fs.rename(tmp, dest, err2 => {
+        if (err2) console.error('Failed to commit learned injections:', err2.message);
+      });
     });
-  });
+  }, 2000);
 }
 
 function loadLearnedInjections() {
@@ -169,6 +181,8 @@ function loadLearnedInjections() {
   } catch { /* absent on first run */ }
 }
 
+// Ensure data/ directory exists once at startup (not on every save)
+fs.mkdirSync(path.join(__dirname, 'data'), { recursive: true });
 loadLearnedInjections();
 
 function cacheConvSuggestions(convId, titles, convQuery, ctx, meta) {
@@ -220,7 +234,9 @@ function buildContextFingerprint(ctx, meta, query, intentsOverride = null) {
     else if (installed)    parts.push('esim:on');
     else if (disabled)     parts.push('esim:dis');
 
-    if (ctx.partnerSlug)        parts.push(`partner:${ctx.partnerSlug}`);
+    // Allow-list partner slugs to prevent key injection via crafted contact attributes
+    const safePartner = (ctx.partnerSlug || '').replace(/[^a-z0-9_-]/g, '').slice(0, 40);
+    if (safePartner && safePartner !== 'user_soft_launch') parts.push(`partner:${safePartner}`);
     if (ctx.isB2B)              parts.push('b2b');
     if (ctx.fraudSuspected)     parts.push('fraud');
     if (ctx.isRestrictedCountry) parts.push('geo:restricted');
@@ -1996,16 +2012,17 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx, storedConvCtxM
     // Render each result with click-tracking URL and 👍/👎 feedback buttons
     for (let i = 0; i < articles.length; i++) {
       const article   = articles[i];
-      const hint      = getArticleHint(article, ctx);
-      // Route through /track so clicks feed into the suggestion engine
-      const trackUrl  = `/track?conv=${encodeURIComponent(convId)}&idx=${i}`;
+      // No hint in results canvas — keeps component count ≤ 25 (QA finding #2)
+      // Hints appear in the suggestions panel where they have more value
+      const trackSig  = crypto.createHmac('sha256', process.env.INTERCOM_CLIENT_SECRET || 'dev')
+        .update(`${convId}:${i}`).digest('hex').slice(0, 16);
+      const trackUrl  = `/track?conv=${encodeURIComponent(convId)}&idx=${i}&sig=${trackSig}`;
       components.push({ type: 'divider' });
       components.push({
         type: 'button', id: `result_${i}`,
         label: article.title, style: 'link',
         action: { type: 'url', url: `${process.env.APP_URL || 'https://kolet-hc-app.onrender.com'}${trackUrl}` },
       });
-      if (hint) components.push({ type: 'text', text: `⚡ ${hint}`, style: 'muted' });
       if (searchRated[i]) {
         components.push({
           type: 'text',
@@ -2367,18 +2384,27 @@ app.get('/debug/feedback', requireDebugToken, (req, res) => {
 app.get('/track', async (req, res) => {
   const convId     = String(req.query.conv || '').slice(0, 100);
   const articleIdx = parseInt(req.query.idx || '0', 10);
+  const sig        = String(req.query.sig || '');
+
+  // Verify HMAC signature to prevent fake-click injection
+  const expectedSig = crypto.createHmac('sha256', process.env.INTERCOM_CLIENT_SECRET || 'dev')
+    .update(`${convId}:${articleIdx}`).digest('hex').slice(0, 16);
+  if (sig !== expectedSig) return res.status(403).send('Forbidden');
 
   const cachedSearch = getCachedConvSearch(convId);
-  if (!cachedSearch) return res.status(404).send('Session expired');
+  if (!cachedSearch) {
+    // Cache miss on restart — redirect to KB root so agents land somewhere useful
+    return res.redirect(302, 'https://www.notion.so/kolet');
+  }
 
   const articleTitle = cachedSearch.articleTitles[articleIdx];
-  if (!articleTitle) return res.status(404).send('Article not found');
+  if (!articleTitle) return res.redirect(302, 'https://www.notion.so/kolet');
 
   // Look up URL from knowledge base (prevents open redirect)
   const articles = await getArticles();
   const tMap     = articleByTitle || new Map(articles.map(a => [a.title, a]));
   const article  = tMap.get(articleTitle);
-  if (!article) return res.status(404).send('Article not in KB');
+  if (!article) return res.redirect(302, 'https://www.notion.so/kolet');
 
   // Record as implicit positive feedback
   const cachedConv = getCachedConvSuggestions(convId);
