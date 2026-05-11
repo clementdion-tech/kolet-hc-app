@@ -1708,7 +1708,8 @@ function getArticleEmoji(article) {
 // Shared article list renderer used by both suggestions and results canvases.
 // withEmoji = true  → prepend category emoji (suggestions view).
 // ratedMap         → { [index]: 'up'|'down' } — shows confirmation instead of buttons.
-function renderArticleComponents(articles, ctx, withEmoji = false, ratedMap = {}) {
+// idPrefix         → unique prefix per section to avoid duplicate component IDs
+function renderArticleComponents(articles, ctx, withEmoji = false, ratedMap = {}, idPrefix = 'open') {
   const components = [];
   for (let i = 0; i < articles.length; i++) {
     const article = articles[i];
@@ -1719,7 +1720,7 @@ function renderArticleComponents(articles, ctx, withEmoji = false, ratedMap = {}
     }
     components.push({
       type:   'button',
-      id:     `open_${i}`,
+      id:     `${idPrefix}_${i}`,
       label:  withEmoji ? `${getArticleEmoji(article)} ${article.title}` : article.title,
       style:  'link',
       action: { type: 'url', url: article.url },
@@ -1800,7 +1801,8 @@ function buildSuggestionsCanvas(articles, convCtx, ctx, ratedMap = {}, searchSec
     if (searchSection.results.length === 0) {
       components.push({ type: 'text', text: 'No articles found.', style: 'muted' });
     } else {
-      components.push(...renderArticleComponents(searchSection.results, ctx, false));
+      // Use 'result' prefix to avoid ID collision with suggestion 'open_N' buttons
+      components.push(...renderArticleComponents(searchSection.results, ctx, false, {}, 'result'));
     }
   }
 
@@ -1962,7 +1964,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     console.log('SUBMIT sugg titles:', feedbackTitles.length, '| cached:', Boolean(cached));
 
     // URL buttons open Notion directly — no state change needed
-    if (componentId.startsWith('open_')) {
+    if (componentId.startsWith('open_') || componentId.startsWith('result_')) {
       return res.status(200).end();
     }
 
