@@ -110,6 +110,27 @@ let lastError  = {};
 const convSuggestionsCache = new Map();
 const CONV_CACHE_MAX = 2000;
 
+// --- Server-side search results cache ---
+// Intercom does NOT reliably send stored_data on button clicks.
+// We cache the last search state per conversation so feedback votes work.
+const convSearchCache = new Map();
+
+function cacheConvSearch(convId, query, articleTitles) {
+  if (!convId) return;
+  convSearchCache.set(String(convId), { query, articleTitles, rated: {}, ts: Date.now() });
+  if (convSearchCache.size > CONV_CACHE_MAX) {
+    convSearchCache.delete(convSearchCache.keys().next().value);
+  }
+}
+
+function getCachedConvSearch(convId) {
+  if (!convId) return null;
+  const entry = convSearchCache.get(String(convId));
+  if (!entry) return null;
+  if (Date.now() - entry.ts > 24 * 60 * 60 * 1000) { convSearchCache.delete(String(convId)); return null; }
+  return entry;
+}
+
 function cacheConvSuggestions(convId, titles, convQuery, ctx, meta) {
   if (!convId) return;
   convSuggestionsCache.set(String(convId), { titles, convQuery, ctx, meta, ts: Date.now() });
@@ -2124,29 +2145,32 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     // ── Search result feedback (search_up_N / search_down_N) ─────────────────
     const searchFeedbackMatch = componentId.match(/^search_(up|down)_(\d+)$/);
     if (searchFeedbackMatch) {
-      const rating         = searchFeedbackMatch[1];
-      const articleIdx     = parseInt(searchFeedbackMatch[2], 10);
-      const searchArticles = Array.isArray(storedData.search_articles) ? storedData.search_articles : [];
-      const searchQ        = String(storedData.search_query || '').slice(0, 300);
-      const prevRated      = storedData.search_rated || {};
-      const articleTitle   = searchArticles[articleIdx];
+      const rating     = searchFeedbackMatch[1];
+      const articleIdx = parseInt(searchFeedbackMatch[2], 10);
+
+      // Server cache is primary — Intercom does NOT reliably send stored_data on clicks
+      const cachedSearch = getCachedConvSearch(convId);
+      const searchTitles = cachedSearch?.articleTitles
+                        || (Array.isArray(storedData.search_articles) ? storedData.search_articles : []);
+      const searchQ      = cachedSearch?.query || String(storedData.search_query || '').slice(0, 300);
+      const prevRated    = cachedSearch?.rated  || storedData.search_rated || {};
+      const articleTitle = searchTitles[articleIdx];
 
       if (articleTitle && titleMap.has(articleTitle)) {
-        recordFeedback(rating, articleTitle, searchQ, resolvedCtx, resolvedMeta, searchArticles);
+        recordFeedback(rating, articleTitle, searchQ, resolvedCtx, resolvedMeta, searchTitles);
       } else {
         console.warn(`Search feedback rejected: unknown article at index ${articleIdx}`);
       }
 
-      // Re-render results with feedback state updated — show confirmation text
-      const newSearchRated = { ...prevRated, [articleIdx]: rating };
-      const resultArticles = searchArticles
-        .map(t => titleMap.get(t))
-        .filter(Boolean);
+      // Persist rated state in server cache for subsequent votes
+      const newRated = { ...prevRated, [articleIdx]: rating };
+      if (cachedSearch) cachedSearch.rated = newRated;
 
+      const resultArticles = searchTitles.map(t => titleMap.get(t)).filter(Boolean);
       return res.json(buildResultsCanvas(
         `Results for "${searchQ}"`, resultArticles,
         resolvedQuery || null, resolvedCtx, resolvedMeta,
-        searchQ, newSearchRated
+        searchQ, newRated
       ));
     }
 
@@ -2172,11 +2196,12 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
       return res.json(searchOnlyCanvas);
     }
 
-    // Pure BM25 search — no context boosts, no RRF synonym expansion.
-    // RRF hurt precision: "fraud" triggered "blocked" variant → VPN/China articles.
-    // For explicit queries the user typed, pure BM25 score wins.
     const searchResults = searchArticles(allArticles, query).slice(0, 5);
     console.log(`Found ${searchResults.length} for "${query}"`);
+
+    // Cache search state server-side — Intercom doesn't reliably return stored_data
+    // on button clicks, so feedback votes must be resolved from this cache.
+    cacheConvSearch(convId, query, searchResults.map(a => a.title));
 
     // Always return a clean results-only canvas — the combined canvas (suggestions + results)
     // exceeded Canvas Kit's component limit (~20-30) causing silent render failure.
