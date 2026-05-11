@@ -1936,6 +1936,7 @@ function buildSuggestionsCanvas(articles, convCtx, ctx, ratedMap = {}, searchSec
 
   const components = [
     ...searchInputComponents(),
+    { type: 'button', id: 'refresh_suggestions', label: '↻ Refresh suggestions', style: 'secondary', action: { type: 'submit' } },
     { type: 'divider' },
     { type: 'text', text: 'Suggested articles', style: 'header' },
   ];
@@ -2246,6 +2247,47 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
         resolvedQuery || null, resolvedCtx, resolvedMeta,
         searchQ, newRated, convId
       ));
+    }
+
+    // ── Refresh suggestions ───────────────────────────────────────────────────
+    // Fetches the latest conversation from Intercom API so suggestions reflect
+    // new messages and any context changes since the panel was opened.
+    if (componentId === 'refresh_suggestions') {
+      const token = process.env.INTERCOM_ACCESS_TOKEN;
+      if (!token || !convId) {
+        return res.json(storedSuggs.length > 0
+          ? buildSuggestionsCanvas(storedSuggs, storedConvCtx, resolvedCtx, storedRated)
+          : searchOnlyCanvas);
+      }
+      try {
+        const convRes = await notionFetch(
+          `https://api.intercom.io/conversations/${convId}`,
+          { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
+        );
+        if (!convRes.ok) throw new Error(`Intercom API ${convRes.status}`);
+        const freshBody   = await convRes.json();
+        const freshConvCtx = extractConversationContext({ conversation: freshBody });
+        const freshCtx     = extractContactContext({ contact: freshBody.contacts?.contacts?.[0] || {} });
+        const freshQuery   = buildConvSearchQuery(freshConvCtx);
+
+        if (freshQuery) {
+          const freshRaw  = searchArticles(allArticles, freshQuery);
+          const freshSugg = applyContextBoosts(allArticles, freshRaw, freshCtx, freshConvCtx);
+          if (freshSugg.length > 0) {
+            cacheConvSuggestions(convId, freshSugg.map(a => a.title),
+              freshQuery.slice(0, 400), freshCtx,
+              { inbox_name: freshConvCtx.inboxName, tags: freshConvCtx.tags });
+            console.log(`REFRESH conv=${convId} → ${freshSugg.length} suggestions`);
+            return res.json(buildSuggestionsCanvas(freshSugg, freshConvCtx, freshCtx));
+          }
+        }
+      } catch (err) {
+        console.warn('Refresh failed:', err.message);
+      }
+      // Fallback: return current suggestions unchanged
+      return res.json(storedSuggs.length > 0
+        ? buildSuggestionsCanvas(storedSuggs, storedConvCtx, resolvedCtx, storedRated)
+        : searchOnlyCanvas);
     }
 
     // ── Clear search results (back_btn) ──────────────────────────────────────
