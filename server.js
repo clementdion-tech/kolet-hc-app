@@ -1345,6 +1345,23 @@ function extractContactContext(body) {
     isNewUser:         (attrs.user_value === 0 || attrs.user_value === null),
     hasReferred:       attrs.has_referred === true,
     language:          attrs.language || '',
+
+    // Wallet / Koins (Wallet Information panel)
+    koinsBalance:      attrs.wallet_koins ?? attrs.koin_balance ?? attrs.koins_balance ?? null,
+    hasWalletCredit:   !!(attrs.wallet_koins || attrs.koin_balance || attrs.koins_balance),
+
+    // Voucher Information panel
+    hasVoucher:        !!(attrs.voucher_code || attrs.latest_voucher_code || attrs.active_voucher),
+    voucherStatus:     (attrs.voucher_status || attrs.latest_voucher_status || '').toLowerCase(),
+
+    // Data donations information panel
+    hasPendingDonation: !!(attrs.pending_data_donation || attrs.data_donation_pending),
+
+    // Contact tags (Tag Information panel) — distinct from conversation tags
+    contactTags:       (contact.tags?.data || []).map(t => (t.name || '').toLowerCase()).filter(Boolean),
+
+    // Raw dump for debugging — lets /debug/last-init show all attrs
+    _rawAttrs:         attrs,
   };
 }
 
@@ -2102,9 +2119,13 @@ app.post('/intercom/initialize', verifyIntercomRequest, async (req, res) => {
     const convCtx = extractConversationContext(req.body);
     const ctx     = extractContactContext(req.body);
 
+    // Store raw attrs for /debug/contact-attrs — helps identify which Intercom panel
+    // uses which attribute name (Wallet, Voucher, Tags, etc.)
+    lastContactAttrs = req.body.contact?.custom_attributes || {};
+
     console.log('INIT conv:', convId, '| inbox:', convCtx.inboxName, '| topic:', convCtx.topic);
     console.log('INIT text (first 200):', convCtx.text.slice(0, 200));
-    console.log('INIT esim:', ctx.esimStatus, '| partner:', ctx.partnerSlug);
+    console.log('INIT esim:', ctx.esimStatus, '| partner:', ctx.partnerSlug, '| tags:', ctx.contactTags.join(',') || 'none');
 
     const augmentedQuery = buildConvSearchQuery(convCtx);
 
@@ -2403,6 +2424,13 @@ app.get('/debug/conv-cache',  requireDebugToken, (req, res) => {
 app.get('/debug/last-init',   requireDebugToken, (req, res) => res.json(lastInit));
 app.get('/debug/last-error',  requireDebugToken, (req, res) => res.json(lastError));
 app.get('/debug/last-submit', requireDebugToken, (req, res) => res.json(lastSubmit));
+
+// Dump ALL contact custom_attributes from the last /initialize — use this to find
+// exact attribute names for any Intercom panel (Wallet, Voucher, Tags, etc.)
+let lastContactAttrs = {};
+app.get('/debug/contact-attrs', requireDebugToken, (req, res) => {
+  res.json({ attrs: lastContactAttrs, count: Object.keys(lastContactAttrs).length });
+});
 app.get('/debug/search', requireDebugToken, async (req, res) => {
   const q = String(req.query.q || '').slice(0, 300);
   const articles = await getArticles();
