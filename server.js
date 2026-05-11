@@ -2125,14 +2125,9 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     const searchResults = applyContextBoosts(allArticles, searchRaw, resolvedCtx, storedConvCtx);
     console.log(`Found ${searchResults.length} for "${query}"`);
 
-    if (storedSuggs.length > 0) {
-      // Show suggestions + search results together — suggestions always stay visible
-      return res.json(buildSuggestionsCanvas(
-        storedSuggs, storedConvCtx, resolvedCtx, storedRated,
-        { query, results: searchResults }
-      ));
-    }
-    // No stored suggestions — show search results only (search-only conversation)
+    // Always return a clean results-only canvas — the combined canvas (suggestions + results)
+    // exceeded Canvas Kit's component limit (~20-30) causing silent render failure.
+    // The ← Back button restores suggestions from the server-side cache.
     return res.json(buildResultsCanvas(`Results for "${query}"`, searchResults, resolvedQuery || null, resolvedCtx, resolvedMeta));
 
   } catch (err) {
