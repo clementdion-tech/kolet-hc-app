@@ -2260,15 +2260,25 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
           : searchOnlyCanvas);
       }
       try {
-        const convRes = await notionFetch(
-          `https://api.intercom.io/conversations/${convId}`,
-          { headers: { Authorization: `Bearer ${token}`, Accept: 'application/json' } }
-        );
-        if (!convRes.ok) throw new Error(`Intercom API ${convRes.status}`);
-        const freshBody   = await convRes.json();
+        const headers = { Authorization: `Bearer ${token}`, Accept: 'application/json' };
+
+        // Fetch conversation (messages) and contact (eSIM, device, partner, plan…) in parallel
+        const convRes = await notionFetch(`https://api.intercom.io/conversations/${convId}`, { headers });
+        if (!convRes.ok) throw new Error(`Intercom conv API ${convRes.status}`);
+        const freshBody = await convRes.json();
+
+        // Get contact ID from conversation then fetch full contact with all custom_attributes
+        const contactId = freshBody.contacts?.contacts?.[0]?.id;
+        let freshContact = {};
+        if (contactId) {
+          const contactRes = await notionFetch(`https://api.intercom.io/contacts/${contactId}`, { headers });
+          if (contactRes.ok) freshContact = await contactRes.json();
+        }
+
         const freshConvCtx = extractConversationContext({ conversation: freshBody });
-        const freshCtx     = extractContactContext({ contact: freshBody.contacts?.contacts?.[0] || {} });
+        const freshCtx     = extractContactContext({ contact: freshContact });
         const freshQuery   = buildConvSearchQuery(freshConvCtx);
+        console.log(`REFRESH conv=${convId} esim=${freshCtx.esimStatus} partner=${freshCtx.partnerSlug}`);
 
         if (freshQuery) {
           const freshRaw  = searchArticles(allArticles, freshQuery);
