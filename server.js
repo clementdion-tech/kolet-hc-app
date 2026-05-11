@@ -268,15 +268,29 @@ function feedbackSentimentMultiplier(votes) {
 
 // articleTitle: the specific article being rated
 // allTitles: all article titles shown in the same set (for context)
-function recordFeedback(rating, articleTitle, convQuery, ctx, meta, allTitles) {
+// Push one row to the Google Sheet (fire-and-forget, never blocks a response)
+function pushToSheet(row) {
+  const url = process.env.GSHEET_WEBHOOK_URL;
+  if (!url) return;
+  fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(row),
+  }).catch(err => console.warn('GSheet push failed:', err.message));
+}
+
+// feedbackType: 'suggestion' | 'search'
+// agentEmail:   string from req.body.admin?.email
+function recordFeedback(rating, articleTitle, convQuery, ctx, meta, allTitles, feedbackType = 'suggestion', agentEmail = '') {
   const entry = {
     ts:             new Date().toISOString(),
-    rating,                                       // 'up' | 'down'
-    rated_article:  articleTitle,                 // specific article rated
+    rating,
+    rated_article:  articleTitle,
     other_articles: allTitles.filter(t => t !== articleTitle),
     conv_query:     convQuery,
     inbox_name:     meta.inbox_name || '',
     tags:           meta.tags       || [],
+    agent_email:    agentEmail,
     ctx_signals:    ctx ? {
       esimStatus:      ctx.esimStatus      || null,
       partnerSlug:     ctx.partnerSlug     || null,
@@ -289,6 +303,20 @@ function recordFeedback(rating, articleTitle, convQuery, ctx, meta, allTitles) {
   };
   feedbackLog.push(entry);
   if (feedbackLog.length > FEEDBACK_MAX) feedbackLog.shift();
+
+  // Push to Google Sheet asynchronously
+  pushToSheet({
+    timestamp:  entry.ts,
+    rating,
+    type:       feedbackType,
+    article:    articleTitle,
+    query:      convQuery || '',
+    esimStatus: ctx?.esimStatus  || '',
+    partner:    ctx?.partnerSlug || '',
+    isB2B:      ctx?.isB2B       || false,
+    inboxName:  meta.inbox_name  || '',
+    agentEmail,
+  });
 
   // Update context-aware training scores
   if (!articleFeedbackScores[articleTitle])
@@ -2112,6 +2140,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     console.log('SUBMIT component_id:', req.body.component_id);
 
     const componentId = String(req.body.component_id || '').slice(0, 100);
+    const agentEmail  = String(req.body.admin?.email || req.body.admin?.name || '').slice(0, 200);
     const convId      = String(req.body.conversation?.id || '');
 
     // Intercom Canvas Kit sends stored_data under `canvas.stored_data`.
@@ -2183,7 +2212,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
           : searchOnlyCanvas);
       }
 
-      recordFeedback(rating, articleTitle, resolvedQuery, resolvedCtx, resolvedMeta, feedbackTitles);
+      recordFeedback(rating, articleTitle, resolvedQuery, resolvedCtx, resolvedMeta, feedbackTitles, 'suggestion', agentEmail);
 
       let displaySuggs = storedSuggs;
       let newRatedMap  = { ...storedRated };
@@ -2230,7 +2259,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
       const articleTitle = searchTitles[articleIdx];
 
       if (articleTitle && titleMap.has(articleTitle)) {
-        recordFeedback(rating, articleTitle, searchQ, resolvedCtx, resolvedMeta, searchTitles);
+        recordFeedback(rating, articleTitle, searchQ, resolvedCtx, resolvedMeta, searchTitles, 'search', agentEmail);
       } else {
         console.warn(`Search feedback rejected: unknown article at index ${articleIdx}`);
       }
@@ -2410,7 +2439,7 @@ app.get('/track', async (req, res) => {
   const cachedConv = getCachedConvSuggestions(convId);
   const ctx        = cachedConv?.ctx || null;
   const meta       = cachedConv?.meta || {};
-  recordFeedback('up', articleTitle, cachedSearch.query, ctx, meta, cachedSearch.articleTitles);
+  recordFeedback('up', articleTitle, cachedSearch.query, ctx, meta, cachedSearch.articleTitles, 'click', '');
 
   // Inject into future suggestions for same contact context
   if (ctx) {
