@@ -1287,6 +1287,16 @@ function extractContactContext(body) {
 
   const partnerSlug = (attrs.initial_referrer_partner_slug || '').toLowerCase().replace(/ /g, '_');
 
+  // Intercom sends timestamps as Unix seconds (e.g. 1749512640).
+  // new Date(seconds) parses as milliseconds → Jan 1970 → always "expired".
+  // Fix: multiply by 1000 when value looks like a 10-digit Unix second timestamp.
+  function parseIntercomDate(val) {
+    if (!val) return null;
+    const n = Number(val);
+    if (!isNaN(n) && n > 0) return new Date(n < 1e12 ? n * 1000 : n);
+    return new Date(val);
+  }
+
   // Data usage: "0 bytes" or 0 means data never started
   const consumed = String(attrs.current_plan_consumed || '').toLowerCase();
   const dataNeverUsed = (consumed === '0 bytes' || consumed === '0' || consumed === '')
@@ -1316,7 +1326,7 @@ function extractContactContext(body) {
 
     // Data plan
     dataNeverUsed,                                          // plan exists but 0 bytes consumed
-    dataExpired:       !!attrs.current_plan_expires_at && new Date(attrs.current_plan_expires_at) < new Date(),
+    dataExpired:       (() => { const d = parseIntercomDate(attrs.current_plan_expires_at); return !!d && d < new Date(); })(),
     planZone,
     planZoneLabel:     (attrs.current_plan_zone_label || attrs.initial_gift_zone_label || '').toLowerCase(),
     isRestrictedCountry,
