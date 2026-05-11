@@ -30,7 +30,15 @@ function notionFetch(url, opts = {}) {
 const app = express();
 // Trust Render's reverse proxy so express-rate-limit reads the real client IP from X-Forwarded-For
 app.set('trust proxy', 1);
-app.use(helmet());
+// helmet hardened for a JSON API served cross-origin by Intercom Canvas Kit:
+// - crossOriginResourcePolicy: cross-origin  → allows Intercom to READ our JSON responses
+// - crossOriginEmbedderPolicy: false          → no COEP interference
+// - contentSecurityPolicy: false              → CSP irrelevant for pure JSON API endpoints
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  crossOriginEmbedderPolicy: false,
+  contentSecurityPolicy: false,
+}));
 
 // Rate limit Intercom endpoints: 120 req/min covers 20 agents × 6 req/min each
 const intercomLimiter = rateLimit({
