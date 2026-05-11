@@ -1899,9 +1899,8 @@ const searchOnlyCanvas = {
   }
 };
 
-function buildResultsCanvas(headerText, articles, convQuery, ctx, storedConvCtxMeta = {}) {
-  // Show "Back to suggestions" whenever there's any stored context that could
-  // restore suggestions — conv_query may be empty for contact-attribute-only suggestions.
+// searchRated: { [idx]: 'up'|'down' } — per-result feedback state (for re-render after vote)
+function buildResultsCanvas(headerText, articles, convQuery, ctx, storedConvCtxMeta = {}, searchQuery = '', searchRated = {}) {
   const hasSuggestions = Boolean(convQuery) || Boolean(ctx);
   const components = [
     ...searchInputComponents(),
@@ -1919,17 +1918,40 @@ function buildResultsCanvas(headerText, articles, convQuery, ctx, storedConvCtxM
   if (articles.length === 0) {
     components.push({ type: 'text', text: 'No articles found.', style: 'muted' });
   } else {
-    components.push(...renderArticleComponents(articles, ctx, false));
+    // Render each result with per-article 👍/👎 feedback buttons
+    for (let i = 0; i < articles.length; i++) {
+      const article = articles[i];
+      const hint    = getArticleHint(article, ctx);
+      components.push({ type: 'divider' });
+      components.push({
+        type: 'button', id: `result_${i}`,
+        label: article.title, style: 'link',
+        action: { type: 'url', url: article.url },
+      });
+      if (hint) components.push({ type: 'text', text: `⚡ ${hint}`, style: 'muted' });
+      if (searchRated[i]) {
+        components.push({
+          type: 'text',
+          text: searchRated[i] === 'up' ? '👍 Marked helpful' : '👎 Marked not helpful',
+          style: 'muted',
+        });
+      } else {
+        components.push({ type: 'button', id: `search_up_${i}`,   label: '👍', style: 'secondary', action: { type: 'submit' } });
+        components.push({ type: 'button', id: `search_down_${i}`, label: '👎', style: 'secondary', action: { type: 'submit' } });
+      }
+    }
   }
 
   return {
     canvas: {
-      // Pass through conv context so back button can re-run the suggestion engine.
       stored_data: {
-        conv_query: convQuery || '',
-        ctx:        ctx || null,
-        inbox_name: storedConvCtxMeta.inbox_name || '',
-        tags:       storedConvCtxMeta.tags        || [],
+        conv_query:      convQuery || '',
+        ctx:             ctx || null,
+        inbox_name:      storedConvCtxMeta.inbox_name || '',
+        tags:            storedConvCtxMeta.tags        || [],
+        search_query:    searchQuery,
+        search_articles: articles.slice(0, 5).map(a => a.title),
+        search_rated:    searchRated,
       },
       content: { components },
     },
@@ -2099,6 +2121,35 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
       return res.json(searchOnlyCanvas);
     }
 
+    // ── Search result feedback (search_up_N / search_down_N) ─────────────────
+    const searchFeedbackMatch = componentId.match(/^search_(up|down)_(\d+)$/);
+    if (searchFeedbackMatch) {
+      const rating         = searchFeedbackMatch[1];
+      const articleIdx     = parseInt(searchFeedbackMatch[2], 10);
+      const searchArticles = Array.isArray(storedData.search_articles) ? storedData.search_articles : [];
+      const searchQ        = String(storedData.search_query || '').slice(0, 300);
+      const prevRated      = storedData.search_rated || {};
+      const articleTitle   = searchArticles[articleIdx];
+
+      if (articleTitle && titleMap.has(articleTitle)) {
+        recordFeedback(rating, articleTitle, searchQ, resolvedCtx, resolvedMeta, searchArticles);
+      } else {
+        console.warn(`Search feedback rejected: unknown article at index ${articleIdx}`);
+      }
+
+      // Re-render results with feedback state updated — show confirmation text
+      const newSearchRated = { ...prevRated, [articleIdx]: rating };
+      const resultArticles = searchArticles
+        .map(t => titleMap.get(t))
+        .filter(Boolean);
+
+      return res.json(buildResultsCanvas(
+        `Results for "${searchQ}"`, resultArticles,
+        resolvedQuery || null, resolvedCtx, resolvedMeta,
+        searchQ, newSearchRated
+      ));
+    }
+
     // ── Clear search results (back_btn) ──────────────────────────────────────
     // Suggestions never disappear — back_btn just hides the search results section.
     if (componentId === 'back_btn') {
@@ -2130,7 +2181,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     // Always return a clean results-only canvas — the combined canvas (suggestions + results)
     // exceeded Canvas Kit's component limit (~20-30) causing silent render failure.
     // The ← Back button restores suggestions from the server-side cache.
-    return res.json(buildResultsCanvas(`Results for "${query}"`, searchResults, resolvedQuery || null, resolvedCtx, resolvedMeta));
+    return res.json(buildResultsCanvas(`Results for "${query}"`, searchResults, resolvedQuery || null, resolvedCtx, resolvedMeta, query));
 
   } catch (err) {
     lastError = { route: 'submit', message: err.message, stack: err.stack, time: new Date().toISOString() };
