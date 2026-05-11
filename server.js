@@ -58,22 +58,22 @@ function verifyIntercomRequest(req, res, next) {
   const secret = (process.env.INTERCOM_CLIENT_SECRET || '').trim(); // trim whitespace from copy-paste
   if (!secret) return next(); // dev mode — no secret configured
 
-  const header = req.headers['x-body-signature'] || '';
-  const digest = 'sha256=' + crypto
+  // Intercom sends x-body-signature as plain hex (no "sha256=" prefix)
+  const received = (req.headers['x-body-signature'] || '').replace(/^sha256=/, '');
+  const expected = crypto
     .createHmac('sha256', secret)
     .update(req.rawBody || '')
     .digest('hex');
 
   let valid = false;
   try {
-    const a = Buffer.from(header);
-    const b = Buffer.from(digest);
+    const a = Buffer.from(received);
+    const b = Buffer.from(expected);
     valid = a.length === b.length && crypto.timingSafeEqual(a, b);
   } catch { /* length mismatch → not equal */ }
 
   if (!valid) {
-    // Log first 16 chars of received vs expected to diagnose secret mismatch without leaking it
-    console.warn(`Rejected: sig mismatch | received=${header.slice(0, 16)}... expected=${digest.slice(0, 16)}... bodyLen=${(req.rawBody || '').length}`);
+    console.warn(`Rejected: sig mismatch | bodyLen=${(req.rawBody || '').length}`);
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
