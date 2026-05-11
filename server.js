@@ -1,16 +1,50 @@
-const express = require('express');
-const crypto  = require('crypto');
-const fs      = require('fs');
-const path    = require('path');
-let _fetchFn  = null;
-const fetch   = globalThis.fetch
+const express   = require('express');
+const crypto    = require('crypto');
+const fs        = require('fs');
+const path      = require('path');
+const helmet    = require('helmet');
+const rateLimit = require('express-rate-limit');
+require('dotenv').config();
+
+// Fail fast in production if critical env vars are missing
+if (process.env.NODE_ENV === 'production' && !process.env.INTERCOM_CLIENT_SECRET) {
+  console.error('FATAL: INTERCOM_CLIENT_SECRET must be set in production');
+  process.exit(1);
+}
+if (!process.env.INTERCOM_CLIENT_SECRET) {
+  console.warn('WARNING: INTERCOM_CLIENT_SECRET not set — all POST requests accepted unauthenticated');
+}
+
+// Native fetch (Node 18+) or node-fetch fallback
+let _fetchFn = null;
+const fetch  = globalThis.fetch
   ? (url, opts) => globalThis.fetch(url, opts)
   : (...args) => (_fetchFn
       ? _fetchFn(...args)
       : import('node-fetch').then(({ default: fn }) => { _fetchFn = fn; return fn(...args); }));
-require('dotenv').config();
+
+// Notion fetch wrapper with 10s timeout — prevents indefinite hangs under Notion outage
+const NOTION_TIMEOUT_MS = 10_000;
+function notionFetch(url, opts = {}) {
+  const ctrl  = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), NOTION_TIMEOUT_MS);
+  return fetch(url, { ...opts, signal: ctrl.signal }).finally(() => clearTimeout(timer));
+}
 
 const app = express();
+app.use(helmet());
+
+// Rate limit Intercom endpoints: 120 req/min covers 20 agents × 6 req/min each
+const intercomLimiter = rateLimit({
+  windowMs: 60_000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests' },
+  skip: () => process.env.NODE_ENV !== 'production',
+});
+app.use('/intercom/', intercomLimiter);
+
 // Capture raw body for Intercom signature verification; cap at 512 KB
 app.use(express.json({
   limit: '512kb',
@@ -184,12 +218,18 @@ function recordFeedback(rating, articleTitle, convQuery, ctx, meta, allTitles) {
   if (rating === 'up') scores.global.ups++;
   else                 scores.global.downs++;
 
-  // Increment context-specific bucket (precise signal for THIS context)
-  if (!scores.ctx[fingerprint]) scores.ctx[fingerprint] = { ups: 0, downs: 0 };
-  if (rating === 'up') scores.ctx[fingerprint].ups++;
-  else                 scores.ctx[fingerprint].downs++;
+  // Increment context-specific bucket — cap at 500 fingerprints per article to bound memory
+  const fp = fingerprint.slice(0, 200);
+  if (!scores.ctx[fp]) {
+    if (Object.keys(scores.ctx).length < 500) scores.ctx[fp] = { ups: 0, downs: 0 };
+    else { /* bucket full — only update global */ }
+  }
+  if (scores.ctx[fp]) {
+    if (rating === 'up') scores.ctx[fp].ups++;
+    else                 scores.ctx[fp].downs++;
+  }
 
-  const ctxMult  = feedbackSentimentMultiplier(scores.ctx[fingerprint]).toFixed(2);
+  const ctxMult  = feedbackSentimentMultiplier(scores.ctx[fp]).toFixed(2);
   const globMult = feedbackSentimentMultiplier(scores.global).toFixed(2);
   console.log(`FEEDBACK ${rating.toUpperCase()} | "${articleTitle}" | ctx="${fingerprint}" | ctx_mult=${ctxMult}× global_mult=${globMult}×`);
 }
@@ -237,7 +277,7 @@ const MAX_BLOCK_DEPTH = 3;
 
 async function fetchBlocksText(blockId, depth = 0) {
   try {
-    const res = await fetch(
+    const res = await notionFetch(
       `https://api.notion.com/v1/blocks/${blockId}/children?page_size=100`,
       {
         headers: {
@@ -287,19 +327,32 @@ async function fetchBlocksText(blockId, depth = 0) {
   }
 }
 
+let _notionRetryAt = 0; // exponential backoff after Notion failures
+
 async function getArticles() {
   // Stale-while-revalidate: serve cached data immediately, refresh Notion in background.
-  // Prevents blocking requests on Notion fetch → eliminates Intercom spinning wheel.
   if (articleCache) {
-    if (Date.now() >= cacheExpiry && !cacheInflight) {
-      cacheInflight = _fetchArticles().finally(() => { cacheInflight = null; });
+    if (Date.now() >= cacheExpiry && !cacheInflight && Date.now() >= _notionRetryAt) {
+      cacheInflight = _fetchArticles()
+        .catch(err => { _notionRetryAt = Date.now() + 30_000; throw err; })
+        .finally(() => { cacheInflight = null; });
     }
     return articleCache;
   }
-  // No cache at all (first cold start) — must wait
-  if (cacheInflight) return cacheInflight;
-  cacheInflight = _fetchArticles().finally(() => { cacheInflight = null; });
-  return cacheInflight;
+  // No cache — cold start. Race Notion fetch against 8s deadline so Intercom never spins.
+  if (cacheInflight) {
+    return Promise.race([
+      cacheInflight,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Notion cold-start timeout')), 8_000)),
+    ]);
+  }
+  cacheInflight = _fetchArticles()
+    .catch(err => { _notionRetryAt = Date.now() + 30_000; throw err; })
+    .finally(() => { cacheInflight = null; });
+  return Promise.race([
+    cacheInflight,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('Notion cold-start timeout')), 8_000)),
+  ]);
 }
 
 // Build df lookup when articles are loaded — called once per cache warm
@@ -327,7 +380,7 @@ async function _fetchArticles() {
     const body = { page_size: 100 };
     if (cursor) body.start_cursor = cursor;
 
-    const res = await fetch(
+    const res = await notionFetch(
       `https://api.notion.com/v1/databases/${process.env.NOTION_DATABASE_ID}/query`,
       {
         method: 'POST',
@@ -467,6 +520,8 @@ async function enrichArticleContent(articles) {
     if (i + 3 < articles.length) await new Promise(r => setTimeout(r, 300));
   }
   console.log('Knowledge base build complete');
+  // Rebuild IDF cache now that extractedKeywords are populated
+  if (articleDfCache) articleDfCache = buildDfCache(articles);
 }
 
 // Customer language → article terms. Each key maps to terms likely in article titles/categories.
@@ -505,7 +560,7 @@ const SYNONYMS = {
 
   // ── Connectivity ─────────────────────────────────────────────────────────
   connection:   ['connect','connectivity','signal','network','no data','internet','roaming','apn',
-                 'not connecting','not working','no service','no internet','not getting service',
+                 'not connecting','no service','no internet','not getting service',
                  'sos','sos only','greyed','greyed out','grayed','grayed out','grey toggle',
                  'gray toggle','toggle grey','toggle gray','esim greyed','toggle disabled',
                  'country constraint','specific country','country issue','country problem',
@@ -734,97 +789,97 @@ const TAG_INTENT_MAP = [
 // Used by applyContextBoosts to force-inject relevant articles for each detected intent.
 const INTENT_INJECT_MAP = [
   ['pin_puk',       a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('pin') || t.includes('puk') ||
            (t.includes('blocked') && (t.includes('esim') || t.includes('sim')));
-  }, 330],
+  }, 420],
   ['locate',        a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('find') || t.includes('locat') || t.includes('cannot find') || t.includes('cannot see');
   }, 320],
   ['connection',    a => {
-    const cat = a.category.toLowerCase();
-    const t   = a.title.toLowerCase();
+    const cat = a._categoryLC;
+    const t   = a._titleLC;
     return cat.includes('connect') || cat.includes('start using') ||
            t.includes('apn') || t.includes('no data') || t.includes('no internet') ||
            t.includes('constraint') || t.includes('country');
   }, 300],
   ['slow',          a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('slow') || t.includes('constraint') || t.includes('country');
   }, 300],
-  ['install',       a => a.category.toLowerCase().includes('install'), 290],
+  ['install',       a => a._categoryLC.includes('install'), 290],
   ['extend',        a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('extend') || t.includes('renew') || t.includes('top up') || t.includes('topup');
   }, 290],
   ['expired',       a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('extend') || t.includes('renew') || t.includes('expir');
   }, 290],
   ['refund',        a => {
-    const cat = a.category.toLowerCase();
-    const t   = a.title.toLowerCase();
+    const cat = a._categoryLC;
+    const t   = a._titleLC;
     return cat.includes('refund') || cat.includes('billing') ||
            t.includes('refund') || t.includes('reimburse') || t.includes('cashback');
   }, 290],
   ['invoice',       a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('invoice') || t.includes('receipt') || t.includes('billing');
   }, 290],
   ['transfer',      a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('reassign') || t.includes('transfer') || t.includes('move') || t.includes('new device');
   }, 290],
   ['account',       a => {
-    const cat = a.category.toLowerCase();
-    const t   = a.title.toLowerCase();
+    const cat = a._categoryLC;
+    const t   = a._titleLC;
     return cat.includes('account') || cat.includes('login') ||
            t.includes('login') || t.includes('otp') || t.includes('password');
   }, 290],
   ['delete_account', a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('delete') || t.includes('unsubscribe');
   }, 290],
   ['change_email',   a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('email') || t.includes('transferring account');
   }, 280],
   ['koins',         a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('koin') || t.includes('wallet') || t.includes('convert') || t.includes('unused');
   }, 290],
   ['voucher',       a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('voucher') || t.includes('promo') || t.includes('referral') || t.includes('discount');
   }, 290],
   ['gift',          a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('gift') || t.includes('donat') || t.includes('share data');
   }, 290],
   ['compatibility', a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('adapter') || t.includes('compatible') || t.includes('compatibility');
   }, 280],
   ['voip',          a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('voip') || t.includes('calling') || t.includes('call');
   }, 310],
   ['miles',         a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('flying blue') || t.includes('air france') || t.includes('afklm') || t.includes('miles');
   }, 290],
   ['fraud',         a => {
-    const cat = a.category.toLowerCase();
-    return cat.includes('fraud') || a.title.toLowerCase().includes('fraud');
+    const cat = a._categoryLC;
+    return cat.includes('fraud') || a._titleLC.includes('fraud');
   }, 290],
   ['government',    a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('egyptian') || t.includes('turkish') || t.includes('government') ||
            t.includes('imei') || t.includes('constraint') || t.includes('country');
   }, 300],
   ['sms',           a => {
-    const t = a.title.toLowerCase();
+    const t = a._titleLC;
     return t.includes('sms') || t.includes('otp') || (t.includes('phone') && t.includes('number'));
   }, 280],
 ];
@@ -943,8 +998,8 @@ function searchArticles(articles, rawQuery) {
   }
 
   const scored = articles.map(article => {
-    const title    = article.title.toLowerCase();
-    const category = article.category.toLowerCase();
+    const title    = article._titleLC;
+    const category = article._categoryLC;
     const keywords = article.keywords;
     const extkw    = article.extractedKeywords || '';
     const content  = article.content || '';
@@ -1130,8 +1185,8 @@ function extractContactContext(body) {
 function getArticleHint(article, ctx) {
   if (!ctx) return null;
 
-  const title    = article.title.toLowerCase();
-  const category = article.category.toLowerCase();
+  const title    = article._titleLC;
+  const category = article._categoryLC;
 
   // Check uninstalled/not-installed FIRST, then installed — avoids "uninstalled".includes("installed")
   const esimUninstalled = /uninstalled|not_installed|deleted/.test(ctx.esimStatus);
@@ -1338,20 +1393,20 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
 
   // ── Step 1: hard contact-attribute signals ────────────────────────────────
   if (ctx?.partnerKeyword) {
-    inject(allArticles, a => a.title.toLowerCase().includes(ctx?.partnerKeyword), 250);
+    inject(allArticles, a => a._titleLC.includes(ctx?.partnerKeyword), 250);
   }
   if (ctx?.fraudSuspected) {
-    inject(allArticles, a => a.category.toLowerCase().includes('fraud'), 200);
+    inject(allArticles, a => a._categoryLC.includes('fraud'), 200);
   }
   if (ctx?.esimCompatible === false) {
     inject(allArticles, a => {
-      const t = a.title.toLowerCase();
+      const t = a._titleLC;
       return t.includes('adapter') || t.includes('compatible');
     }, 220);
   }
   if (ctx?.isRestrictedCountry) {
     inject(allArticles, a => {
-      const t = a.title.toLowerCase();
+      const t = a._titleLC;
       return t.includes('egyptian') || t.includes('turkish') ||
              (t.includes('blocked') && t.includes('government')) ||
              t.includes('constraint');
@@ -1359,13 +1414,13 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
   }
   if (ctx?.hasFlyingBlue) {
     inject(allArticles, a => {
-      const t = a.title.toLowerCase();
+      const t = a._titleLC;
       return t.includes('air france') || t.includes('flying blue');
     }, 210);
   }
   if (ctx?.isB2B) {
     inject(allArticles, a => {
-      const t = a.title.toLowerCase();
+      const t = a._titleLC;
       return t.includes('b2b') || t.includes('business');
     }, 200);
   }
@@ -1396,13 +1451,13 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
   if (combined.length === 0 && (ctx?.esimStatus || convCtx?.text)) {
     if (esimInstalled) {
       inject(allArticles, a => {
-        const cat = a.category.toLowerCase();
-        const t   = a.title.toLowerCase();
+        const cat = a._categoryLC;
+        const t   = a._titleLC;
         return cat.includes('connect') || cat.includes('start using') ||
                t.includes('find') || t.includes('locat') || t.includes('constraint');
       }, 120);
     } else if (esimUninstalled || !ctx?.esimIccid) {
-      inject(allArticles, a => a.category.toLowerCase().includes('install'), 120);
+      inject(allArticles, a => a._categoryLC.includes('install'), 120);
     }
     combined.push(...injected.filter(a => !scored.some(s => s.url === a.url)));
   }
@@ -1418,8 +1473,8 @@ function applyContextBoosts(allArticles, scored, ctx, convCtx) {
 
   return combined.map(article => {
     let bonus = 0;
-    const title    = article.title.toLowerCase();
-    const category = article.category.toLowerCase();
+    const title    = article._titleLC;
+    const category = article._categoryLC;
 
     // --- eSIM status signals ---
     if (esimUninstalled) {
@@ -1848,7 +1903,7 @@ app.post('/intercom/initialize', verifyIntercomRequest, async (req, res) => {
         console.log(`Suggested ${suggestions.length} articles for conv=${convId} inbox="${convCtx.inboxName}"`);
         // Cache by conversation ID — submit handler uses this as primary source
         cacheConvSuggestions(convId, suggestions.map(a => a.title),
-          buildConvSearchQuery(convCtx).slice(0, 400), ctx,
+          augmentedQuery.slice(0, 400), ctx,
           { inbox_name: convCtx.inboxName, tags: convCtx.tags });
         return res.json(buildSuggestionsCanvas(suggestions, convCtx, ctx));
       }
@@ -1867,7 +1922,7 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     lastSubmit = { componentId: req.body.component_id, convId: req.body.conversation?.id, ts: new Date().toISOString() };
     console.log('SUBMIT component_id:', req.body.component_id);
 
-    const componentId = req.body.component_id || '';
+    const componentId = String(req.body.component_id || '').slice(0, 100);
     const convId      = String(req.body.conversation?.id || '');
 
     // Intercom Canvas Kit sends stored_data under `canvas.stored_data`.
@@ -1879,13 +1934,24 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     console.log('SUBMIT conv:', convId, '| component:', componentId,
                 '| storedData keys:', Object.keys(storedData).join(','));
 
-    // Merge: server cache wins over stored_data (more reliable)
-    const cached          = getCachedConvSuggestions(convId);
-    const feedbackTitles  = cached?.titles          || storedData.feedback_articles || [];
-    const resolvedCtx     = cached?.ctx             || storedData.ctx               || null;
-    const resolvedQuery   = cached?.convQuery       || storedData.conv_query        || '';
-    const resolvedMeta    = cached?.meta            || { inbox_name: storedData.inbox_name || '', tags: storedData.tags || [] };
-    const storedRated     = storedData.rated        || {};
+    // Server cache is source of truth. storedData fallbacks sanitized to prevent injection.
+    const cached = getCachedConvSuggestions(convId);
+    if (!cached) console.warn(`SUBMIT cache miss conv=${convId}`);
+
+    // feedbackTitles: clamp to 7 entries, each a string max 200 chars
+    const rawFeedbackTitles = cached?.titles || storedData.feedback_articles || [];
+    const feedbackTitles = (Array.isArray(rawFeedbackTitles) ? rawFeedbackTitles : [])
+      .slice(0, 7).map(t => String(t).slice(0, 200));
+
+    // resolvedCtx: never trust storedData.ctx — only use server-side cache
+    const resolvedCtx = cached?.ctx || null;
+
+    const resolvedQuery = String(cached?.convQuery || storedData.conv_query || '').slice(0, 400);
+    const resolvedMeta  = cached?.meta || {
+      inbox_name: String(storedData.inbox_name || '').slice(0, 100),
+      tags: (Array.isArray(storedData.tags) ? storedData.tags : []).slice(0, 20).map(t => String(t).slice(0, 50)),
+    };
+    const storedRated = storedData.rated || {};
 
     console.log('SUBMIT sugg titles:', feedbackTitles.length, '| cached:', Boolean(cached));
 
@@ -1912,9 +1978,21 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
     // ── Per-article feedback (feedback_up_N / feedback_down_N) ───────────────
     const feedbackMatch = componentId.match(/^feedback_(up|down)_(\d+)$/);
     if (feedbackMatch) {
-      const rating       = feedbackMatch[1];
-      const articleIdx   = parseInt(feedbackMatch[2], 10);
-      const articleTitle = feedbackTitles[articleIdx] || `article_${articleIdx}`;
+      const rating     = feedbackMatch[1];
+      const articleIdx = parseInt(feedbackMatch[2], 10);
+
+      if (articleIdx >= feedbackTitles.length) {
+        return res.json(storedSuggs.length > 0
+          ? buildSuggestionsCanvas(storedSuggs, storedConvCtx, resolvedCtx, storedRated)
+          : searchOnlyCanvas);
+      }
+      const articleTitle = feedbackTitles[articleIdx];
+      if (!articleTitle || !titleMap.has(articleTitle)) {
+        console.warn(`Feedback rejected: unknown article "${articleTitle}"`);
+        return res.json(storedSuggs.length > 0
+          ? buildSuggestionsCanvas(storedSuggs, storedConvCtx, resolvedCtx, storedRated)
+          : searchOnlyCanvas);
+      }
 
       recordFeedback(rating, articleTitle, resolvedQuery, resolvedCtx, resolvedMeta, feedbackTitles);
 
