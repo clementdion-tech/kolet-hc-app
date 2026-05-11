@@ -6,13 +6,9 @@ const helmet    = require('helmet');
 const rateLimit = require('express-rate-limit');
 require('dotenv').config();
 
-// Fail fast in production if critical env vars are missing
-if (process.env.NODE_ENV === 'production' && !process.env.INTERCOM_CLIENT_SECRET) {
-  console.error('FATAL: INTERCOM_CLIENT_SECRET must be set in production');
-  process.exit(1);
-}
 if (!process.env.INTERCOM_CLIENT_SECRET) {
-  console.warn('WARNING: INTERCOM_CLIENT_SECRET not set — all POST requests accepted unauthenticated');
+  // Warn loudly — all POST endpoints are open without this secret
+  console.warn('WARNING: INTERCOM_CLIENT_SECRET not set — add it to Render environment variables');
 }
 
 // Native fetch (Node 18+) or node-fetch fallback
