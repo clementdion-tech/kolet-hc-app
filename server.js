@@ -28,6 +28,8 @@ function notionFetch(url, opts = {}) {
 }
 
 const app = express();
+// Trust Render's reverse proxy so express-rate-limit reads the real client IP from X-Forwarded-For
+app.set('trust proxy', 1);
 app.use(helmet());
 
 // Rate limit Intercom endpoints: 120 req/min covers 20 agents × 6 req/min each
@@ -53,7 +55,7 @@ app.use(express.json({
 // Set INTERCOM_CLIENT_SECRET in env. If the var is absent the check is skipped
 // (allows local dev without the secret), but in production it MUST be set.
 function verifyIntercomRequest(req, res, next) {
-  const secret = process.env.INTERCOM_CLIENT_SECRET;
+  const secret = (process.env.INTERCOM_CLIENT_SECRET || '').trim(); // trim whitespace from copy-paste
   if (!secret) return next(); // dev mode — no secret configured
 
   const header = req.headers['x-body-signature'] || '';
@@ -64,14 +66,14 @@ function verifyIntercomRequest(req, res, next) {
 
   let valid = false;
   try {
-    // timingSafeEqual requires equal-length buffers
     const a = Buffer.from(header);
     const b = Buffer.from(digest);
     valid = a.length === b.length && crypto.timingSafeEqual(a, b);
   } catch { /* length mismatch → not equal */ }
 
   if (!valid) {
-    console.warn('Rejected request: invalid Intercom signature');
+    // Log first 16 chars of received vs expected to diagnose secret mismatch without leaking it
+    console.warn(`Rejected: sig mismatch | received=${header.slice(0, 16)}... expected=${digest.slice(0, 16)}... bodyLen=${(req.rawBody || '').length}`);
     return res.status(401).json({ error: 'Unauthorized' });
   }
   next();
