@@ -474,6 +474,9 @@ async function getArticles() {
       new Promise((_, reject) => setTimeout(() => reject(new Error('Notion cold-start timeout')), 8_000)),
     ]);
   }
+  if (Date.now() < _notionRetryAt) {
+    throw new Error('You have been rate limited. Please try again in a few minutes.');
+  }
   cacheInflight = _fetchArticles()
     .catch(err => { _notionRetryAt = Date.now() + 30_000; throw err; })
     .finally(() => { cacheInflight = null; });
