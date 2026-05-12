@@ -348,7 +348,7 @@ let articleDfCache = null;
 let articleByTitle = null;
 let cacheExpiry    = 0;
 let cacheInflight  = null;
-const CACHE_TTL    = 30 * 60 * 1000;
+const CACHE_TTL    = 24 * 60 * 60 * 1000;
 
 // --- Intercom contact cache (10-min TTL) ---
 const CONTACT_CACHE_TTL = 10 * 60 * 1000;
