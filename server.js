@@ -94,6 +94,24 @@ function verifyIntercomRequest(req, res, next) {
   next();
 }
 
+function verifyNotionWebhook(req, res, next) {
+  const secret = (process.env.NOTION_WEBHOOK_SECRET || '').trim();
+  if (!secret) return next();
+  const received = (req.headers['x-notion-signature'] || '').replace(/^sha256=/, '');
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(req.rawBody || '')
+    .digest('hex');
+  let valid = false;
+  try {
+    const a = Buffer.from(received);
+    const b = Buffer.from(expected);
+    valid = a.length === b.length && crypto.timingSafeEqual(a, b);
+  } catch { /* length mismatch */ }
+  if (!valid) return res.status(401).json({ error: 'Unauthorized' });
+  next();
+}
+
 // Protect debug endpoints — require ?token=<DEBUG_TOKEN> or X-Debug-Token header.
 // If DEBUG_TOKEN env var is not set, debug endpoints return 403 (disabled in prod).
 function requireDebugToken(req, res, next) {
@@ -330,7 +348,27 @@ let articleDfCache = null;
 let articleByTitle = null;
 let cacheExpiry    = 0;
 let cacheInflight  = null;
-const CACHE_TTL    = 5 * 60 * 1000;
+const CACHE_TTL    = 30 * 60 * 1000;
+
+// --- Intercom contact cache (10-min TTL) ---
+const CONTACT_CACHE_TTL = 10 * 60 * 1000;
+const CONTACT_CACHE_MAX = 500;
+const _contactCache = new Map(); // contactId → { data, expiresAt }
+
+function getCachedContact(contactId) {
+  const entry = _contactCache.get(contactId);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) { _contactCache.delete(contactId); return null; }
+  return entry.data;
+}
+
+function setCachedContact(contactId, data) {
+  if (_contactCache.size >= CONTACT_CACHE_MAX) {
+    // Evict the oldest entry
+    _contactCache.delete(_contactCache.keys().next().value);
+  }
+  _contactCache.set(contactId, { data, expiresAt: Date.now() + CONTACT_CACHE_TTL });
+}
 
 // --- Article cache persistence (eliminates cold-start spinning wheel) ---
 const ARTICLES_FILE = path.join(__dirname, 'data', 'articles.json');
@@ -2315,8 +2353,16 @@ app.post('/intercom/submit', verifyIntercomRequest, async (req, res) => {
         const contactId = freshBody.contacts?.contacts?.[0]?.id;
         let freshContact = {};
         if (contactId != null && contactId !== '') {
-          const contactRes = await intercomFetch(`https://api.intercom.io/contacts/${contactId}`, { headers });
-          if (contactRes.ok) freshContact = await contactRes.json();
+          const cached = getCachedContact(contactId);
+          if (cached) {
+            freshContact = cached;
+          } else {
+            const contactRes = await intercomFetch(`https://api.intercom.io/contacts/${contactId}`, { headers });
+            if (contactRes.ok) {
+              freshContact = await contactRes.json();
+              setCachedContact(contactId, freshContact);
+            }
+          }
         }
 
         const freshConvCtx = extractConversationContext({ conversation: freshBody });
@@ -2539,5 +2585,23 @@ app.get('/health', (req, res) => res.json({ ok: true, cached: articleCache?.leng
     if (!articleCache) setTimeout(warmCache, 30_000);
   }
 })();
+
+// Notion webhook — invalidates article cache on database/page changes.
+// Configure in Notion Developer settings → Integrations → Webhooks.
+// Set NOTION_WEBHOOK_SECRET to the signing secret Notion provides.
+app.post('/notion/webhook', verifyNotionWebhook, (req, res) => {
+  const { type, challenge } = req.body || {};
+  // Verification challenge on initial webhook registration
+  if (type === 'verification' && challenge) {
+    console.log('Notion webhook verified');
+    return res.json({ challenge });
+  }
+  // Any change event → mark cache stale so next getArticles() triggers a refresh
+  if (type) {
+    console.log(`Notion webhook: ${type} — marking article cache stale`);
+    cacheExpiry = 0;
+  }
+  res.sendStatus(200);
+});
 
 app.listen(process.env.PORT || 3000, () => console.log('KokoBrain app running'));
